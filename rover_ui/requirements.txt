@@ -1,0 +1,22 @@
+# Web backend
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.0
+
+# Vision / encoding
+opencv-python>=4.8
+numpy>=1.24
+
+# Sensors
+# IMPORTANT: T265 support was REMOVED in librealsense/pyrealsense2 2.54.
+# 2.53.1 is the last release that still includes T265 (tm2/pose) support, and
+# it also fully supports the D435i — so both RealSense devices share one pin.
+# On Jetson (aarch64) a prebuilt wheel may not exist; build librealsense<=2.53
+# from source against JetPack if `pip install` can't find it.
+pyrealsense2==2.53.1   # D435i (RGB) + T265 (pose) — do NOT bump to >=2.54
+pyserial>=3.5          # IWR6843ISK mmWave
+
+# NOTE: rospy / geometry_msgs come from the system ROS 1 (Noetic) install,
+# NOT pip. Source your ROS workspace before launching:
+#   source /opt/ros/noetic/setup.bash
+# The backend degrades gracefully (no cmd_vel published) if ROS is unavailable.

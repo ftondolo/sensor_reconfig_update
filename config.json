@@ -1,0 +1,11 @@
+{
+  "format": "pathlab-config",
+  "version": 1,
+  "units": "mm",
+  "car": {
+    "width": 700,
+    "length": 750
+  },
+  "clearance": 100,
+  "turn_penalty": 1500
+}

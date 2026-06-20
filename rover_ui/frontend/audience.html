@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rover Map Navigation — Live</title>
+  <link rel="stylesheet" href="/static/audience.css?v=demo10" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="title">🗺️ BEV Map Navigation <span class="sub">detect → place on map → plan around obstacles → drive to 2 m standoff</span></div>
+    <div class="right">
+      <span id="nav-chip" class="chip nav-chip">nav: —</span>
+      <span id="ws-dot" class="dot dot-off"></span>
+      <a class="op-link" href="/" target="_blank">Operator ↗</a>
+    </div>
+  </header>
+
+  <main class="stage">
+    <!-- ============ BEV map (the star of this version) ============ -->
+    <section class="map-pane">
+      <div class="cam-card map-card">
+        <div class="cam-head">
+          <span>Arena Map <span class="dim">6 m × 6 m · obstacles pre-marked</span></span>
+          <span id="nav-badge" class="badge">—</span>
+        </div>
+        <div class="cam-body map-body"><canvas id="map-canvas" width="900" height="900"></canvas></div>
+        <div class="map-strip">
+          <span>rover <b id="rover-xy">—</b></span>
+          <span>target <b id="target-xy">—</b></span>
+          <span>goal <b id="goal-xy">—</b></span>
+          <span>leg <b id="nav-leg">—</b></span>
+          <span>pose <b id="pose-src">—</b></span>
+        </div>
+      </div>
+      <div class="legend">
+        <span><i class="sw sw-rover"></i>rover (footprint + heading)</span>
+        <span><i class="sw sw-target"></i>detected person</span>
+        <span><i class="sw sw-goal"></i>standoff goal (target − 2 m)</span>
+        <span><i class="sw sw-obs"></i>obstacle (+ clearance halo)</span>
+        <span><i class="sw sw-path"></i>planned rectilinear path</span>
+      </div>
+    </section>
+
+    <!-- ============ sensor grid ============ -->
+    <section class="grid">
+      <div class="cam-card">
+        <div class="cam-head"><span>RGB + Detection</span><span id="st-detector" class="badge">—</span></div>
+        <div class="cam-body"><img id="detect-img" class="cam-img" alt="rgb + detections" /></div>
+      </div>
+      <div class="cam-card">
+        <div class="cam-head"><span>Thermal (FLIR)</span><span id="st-flir_thermal" class="badge">—</span></div>
+        <div class="cam-body"><img id="thermal-img" class="cam-img" alt="thermal" /></div>
+      </div>
+      <div class="cam-card">
+        <div class="cam-head"><span>Depth (D435i)</span><span id="st-d435i_rgb" class="badge">—</span></div>
+        <div class="cam-body"><img id="depth-img" class="cam-img" alt="depth" /></div>
+      </div>
+      <div class="cam-card">
+        <div class="cam-head"><span>mmWave Radar</span><span id="st-mmwave_radar" class="badge">—</span></div>
+        <div class="cam-body"><canvas id="mmwave-canvas" class="cam-canvas" width="520" height="400"></canvas></div>
+      </div>
+    </section>
+
+    <!-- ============ side panel ============ -->
+    <aside class="side">
+      <div class="card nav-card">
+        <div class="save-top">🧭 NAVIGATION</div>
+        <div id="nav-status-big" class="nav-big">IDLE</div>
+        <div id="nav-msg" class="save-sub">waiting for a detection…</div>
+        <div class="adapt-grid">
+          <div><span class="k">Standoff</span><span class="v">2.0 m</span></div>
+          <div><span class="k">Auto</span><span id="nav-auto" class="v">off</span></div>
+          <div><span class="k">Follow</span><span id="nav-follow" class="v">off</span></div>
+          <div><span class="k">Moving</span><span id="nav-moving" class="v">no</span></div>
+          <div><span class="k">Control</span><span id="nav-ros" class="v">—</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Sensor Contribution</h3>
+        <p class="card-sub">How much each sensor drove the current detection.</p>
+        <div class="contrib">
+          <div class="contrib-row">
+            <span class="c-label">RGB</span>
+            <div class="bar"><div id="bar-rgb" class="bar-fill rgb"></div></div>
+            <span id="pct-rgb" class="c-pct">0%</span>
+          </div>
+          <div class="contrib-row">
+            <span class="c-label">Thermal</span>
+            <div class="bar"><div id="bar-thermal" class="bar-fill thermal"></div></div>
+            <span id="pct-thermal" class="c-pct">0%</span>
+          </div>
+          <div class="contrib-row">
+            <span class="c-label">Radar</span>
+            <div class="bar"><div id="bar-radar" class="bar-fill radar"></div></div>
+            <span id="pct-radar" class="c-pct">0%</span>
+          </div>
+        </div>
+        <div class="adapt-grid">
+          <div><span class="k">Detections</span><span id="det-count" class="v">0</span></div>
+          <div><span class="k">Range</span><span id="det-range" class="v">—</span></div>
+          <div><span class="k">Bearing</span><span id="det-az" class="v">—</span></div>
+          <div><span class="k">Source</span><span id="det-source" class="v">—</span></div>
+        </div>
+      </div>
+
+      <div class="card save-card">
+        <div class="save-top">⚡ ADAPTIVE COMPUTE</div>
+        <div class="save-big"><span id="save-big">0</span><span class="save-pct">%</span></div>
+        <div class="save-sub">GPU compute saved by adaptive resolution</div>
+        <div class="save-bar"><div id="save-fill" class="save-fill"></div></div>
+        <div class="tier-rows">
+          <div class="tier-row">
+            <span class="tier-name">RGB</span>
+            <div class="tiers rgbT" id="tiers-rgb">
+              <span class="tier" data-t="full">full</span>
+              <span class="tier" data-t="3/4">3/4</span>
+              <span class="tier" data-t="1/2">1/2</span>
+              <span class="tier" data-t="1/4">1/4</span>
+            </div>
+          </div>
+          <div class="tier-row">
+            <span class="tier-name">Thermal</span>
+            <div class="tiers thermT" id="tiers-therm">
+              <span class="tier" data-t="full">full</span>
+              <span class="tier" data-t="3/4">3/4</span>
+              <span class="tier" data-t="1/2">1/2</span>
+              <span class="tier" data-t="1/4">1/4</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card grow">
+        <h3>Per-detection</h3>
+        <div id="det-list" class="det-list">
+          <div class="det-empty">No people detected.</div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script src="/static/map_view.js?v=demo10"></script>
+  <script src="/static/audience.js?v=demo12"></script>
+</body>
+</html>

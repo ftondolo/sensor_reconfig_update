@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Model weights — large binaries, not tracked (see model_stack/README.md)
+model_stack/weights/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Local editor / tooling state
+.claude/
+.idea/
+.vscode/
+
+# Runtime artifacts
+*.log
+/tmp/
+sample_map.json
+sample_config.json
