@@ -82,7 +82,12 @@ class Config:
     # not, the rover rotates in place to fix it — but only for this long, then
     # the move finishes as "arrived" (position is good; we never spin forever
     # chasing the last fraction of a degree). 0 disables the in-place phase.
-    ARRIVE_SETTLE_TIMEOUT = 1.5  # s: max time rotating in place after position is reached
+    # Max time spent rotating in place once position is reached. 0 = never do it:
+    # accept arrival on position alone and let the next leg's heading-hold
+    # correct the residual while actually making progress. The rover never turns
+    # deliberately (omni base, fixed sensor heading), so all yaw is drift, and
+    # correcting it standing still is where the oscillation lived.
+    ARRIVE_SETTLE_TIMEOUT = 0.0
 
     # Heading-hold: actively drive yaw back to the start heading every tick so
     # the rover translates without rotating (a strafe stays straight, and any
@@ -94,15 +99,41 @@ class Config:
                                #    drifts slightly while strafing) so heading
                                #    returns fully to zero, not just close
     YAW_I_MAX = 0.35           # rad/s cap on the integral contribution (anti-windup)
-    YAW_DEADBAND = 0.012       # rad (~0.7 deg): below this, leave yaw alone (no hunting)
+    # Deadband MUST be >= YAW_TOL. When the band the controller stops correcting
+    # in is narrower than the band it is judged against, it keeps nudging inside
+    # the "arrived" window and hunts. Was 0.012 (0.7 deg) against a 0.020 tol.
+    YAW_DEADBAND = 0.020       # rad (~1.1 deg): below this, leave yaw alone
     YAW_TOL = 0.020            # rad (~1.1 deg): heading must be within this to arrive
+    YAW_I_BLEED = 2.0          # 1/s: how fast the integral decays once settled
     MAX_YAW = 0.6              # rad/s cap
     RAMP_STEP_YAW = 0.5        # rad/s max change per tick
 
     # Safety.
-    MOVE_TIMEOUT_BASE = 4.0    # s of slack added to every move's deadline
+    # Stiction integral for TRANSLATION. Pure P cannot push through static
+    # friction; this accrues while the rover is commanded to move but is closing
+    # on the goal slower than LIN_STICTION_EPS, and bleeds off once it moves
+    # properly. Integrating time-stuck rather than distance-error keeps it from
+    # winding up during normal cruise and overshooting at the end of a leg.
+    LIN_IGAIN = 0.6            # m/s of boost per second spent stuck
+    LIN_I_MAX = 0.10           # m/s cap on the boost (anti-windup)
+    LIN_STICTION_EPS = 0.02    # m/s closing speed below which "stuck" accrues
+    LIN_I_BLEED = 3.0          # bleed-off multiplier once moving properly
+    MOVE_TIMEOUT_BASE = 9.0    # s of slack added to every move's deadline
     MOVE_MIN_SPEED = 0.04      # m/s assumed worst-case progress for the deadline calc
     LOST_CONF = 0              # T265 tracker_confidence == this => tracking failed
+
+    # Stall watchdog. MOVE_TIMEOUT_BASE/MOVE_MIN_SPEED above sizes a per-move
+    # deadline for the WORST-CASE real speed, which can be tens of seconds to
+    # minutes for a normal leg — fine as a hard backstop, but far too slow to
+    # notice "commanded to move but genuinely isn't" (stuck wheel, e-stop,
+    # motor fault) or a T265 tracking loss that never recovers. Instead, track
+    # the best (smallest) remaining distance-to-goal seen so far; if it hasn't
+    # improved by STALL_MIN_PROGRESS_M within STALL_TIMEOUT seconds, fail the
+    # move immediately with reason "stalled" so the caller (Navigator) can
+    # clear the failed move and accept a new command right away instead of
+    # being blocked behind it until the full deadline elapses.
+    STALL_TIMEOUT = 5.0           # s of no meaningful progress before failing fast
+    STALL_MIN_PROGRESS_M = 0.005  # m: minimum shrink in remaining error that counts as progress
 
     # ROS wiring (matches the verified WHEELTEC base in the sibling project).
     ROS_NODE_NAME = "purely_control"
@@ -113,6 +144,15 @@ class Config:
     T265_OPEN_RETRIES = 2
     T265_RESET_WAIT = 5.0      # s to wait after a hardware_reset re-enumerates
 
+    # Lever arm: where the T265 sits relative to the rover's TURN CENTRE, in the
+    # rover body frame, METRES (+fwd = toward the front, +right = to the right).
+    # Rotating in place swings a sensor mounted off centre through an arc, which
+    # it reports as real translation; without this the believed position slides
+    # sideways on every heading correction. Compensated in _make_pose so that
+    # EVERYTHING downstream — the control loop's own distance-to-goal included —
+    # works in rover-centre coordinates.
+    SENSOR_OFFSET_FWD = 0.060
+    SENSOR_OFFSET_RIGHT = 0.0
     # Sign flips to reconcile the T265 mounting/convention with the base wiring.
     # Right is +x (T265); ROS body +y is LEFT, so right maps to -linear.y by
     # default. Forward is +linear.x. YAW_SIGN is the important one: if the T265's
@@ -132,6 +172,15 @@ class Config:
     # still advanced, so normal motion after a relocalisation step keeps being
     # tracked from the new position). The *_BASE terms allow per-frame noise
     # regardless of frame interval. Set POSE_JUMP_MAX_SPEED huge to disable.
+    # Accept a pose STEP while the rover is commanded stationary. The T265
+    # relocalises against its own continuously-built map; those corrections
+    # arrive as one large step, which the filter below otherwise discards
+    # permanently, re-applying drift the device had just removed. A real
+    # teleport is impossible while stopped, so a step there is either a
+    # relocalisation (wanted) or a tracking fault. Steps DURING motion are still
+    # rejected. Set False to restore the old always-reject behaviour.
+    POSE_JUMP_ACCEPT_WHEN_STILL = True
+    POSE_STILL_EPS = 0.005         # m/s — commanded speed below which "stationary"
     POSE_JUMP_MAX_SPEED = 1.5      # m/s — well above the rover's real top speed
     POSE_JUMP_BASE_M = 0.05        # m — per-frame position allowance (noise)
     POSE_JUMP_MAX_YAW_RATE = 4.0   # rad/s — ~230 deg/s, above any real turn here
@@ -152,7 +201,7 @@ class MoveResult:
 
     def __init__(self, ok, reason, axis, target, reached, error, yaw_error, elapsed):
         self.ok = ok              # bool
-        self.reason = reason      # "arrived" | "timeout" | "cancelled" | "tracking_lost"
+        self.reason = reason      # "arrived" | "timeout" | "cancelled" | "tracking_lost" | "stalled"
         self.axis = axis          # e.g. "x" / "z" / "right,forward"
         self.target = target      # (right_m, forward_m) goal in the start-body frame
         self.reached = reached    # (right_m, forward_m) actually reached
@@ -175,7 +224,8 @@ class _Goal:
     """A live move target plus the pose snapshot it is measured against."""
 
     __slots__ = ("right", "forward", "axis", "rx0", "rf0", "yaw0", "hold_yaw",
-                 "t_start", "deadline", "done", "result", "in_tol_since", "pos_since")
+                 "t_start", "deadline", "done", "result", "in_tol_since", "pos_since",
+                 "best_dist", "best_dist_t", "lin_i", "prev_dist", "prev_t")
 
     def __init__(self, right, forward, axis, pose, timeout, hold_yaw=None):
         self.right = right            # goal displacement, start-body frame
@@ -195,6 +245,11 @@ class _Goal:
         self.result = None
         self.in_tol_since = None
         self.pos_since = None         # when position first entered POS_TOL
+        self.best_dist = None         # smallest remaining distance-to-goal seen (stall watchdog)
+        self.best_dist_t = self.t_start  # when best_dist last improved
+        self.lin_i = 0.0              # stiction integral, seconds-stuck (per leg)
+        self.prev_dist = None         # previous tick's distance-to-goal, for closing speed
+        self.prev_t = self.t_start
 
 
 class T265RoverService:
@@ -224,6 +279,9 @@ class T265RoverService:
         self._raw_last = None         # [rx, rf, yaw] previous RAW T265 pose
         self._filt_last_t = 0.0
         self._pose_jumps = 0          # count of rejected teleports (diagnostics)
+        self._reloc_accepted = 0      # count of relocalisation steps ACCEPTED while still
+        self._cmd_still = True        # is the commanded body velocity ~zero right now?
+                                      # (set by the control loop, read by _filter_pose)
         self._last_jump_log = 0.0
 
         self._pipe = None
@@ -580,6 +638,21 @@ class T265RoverService:
             self._filt[2] = _wrap(self._filt[2] + dyaw)
         else:
             jumped = True
+        if jumped and self._cmd_still and self.cfg.POSE_JUMP_ACCEPT_WHEN_STILL:
+            # Commanded stationary: the rover cannot physically have moved, so
+            # this step is the T265 relocalising (or a tracking fault, which the
+            # confidence gate catches). ACCEPT it — discarding it would re-apply
+            # the very drift the device just removed. Snap the filtered pose to
+            # the raw one rather than integrating the delta.
+            self._filt = [rx, rf, yaw]
+            self._reloc_accepted += 1
+            if now - self._last_jump_log > 2.0:
+                self._last_jump_log = now
+                print("[T265RoverService] accepted relocalisation #%d while still "
+                      "(dpos=%.2fm dyaw=%.0fdeg)"
+                      % (self._reloc_accepted, math.hypot(dpx, dpf),
+                         math.degrees(abs(dyaw))))
+            return self._filt[0], self._filt[1], self._filt[2]
         if jumped:
             self._pose_jumps += 1
             if now - self._last_jump_log > 2.0:
@@ -591,11 +664,33 @@ class T265RoverService:
         return self._filt[0], self._filt[1], self._filt[2]
 
     @property
+    def reloc_accepted(self):
+        """Count of T265 relocalisation steps ACCEPTED while commanded still.
+        A healthy non-zero value means the device is correcting its own drift
+        and the correction is now being kept rather than discarded."""
+        return self._reloc_accepted
+
+    @property
     def pose_jumps(self):
         """Number of T265 teleport frames rejected so far (diagnostics)."""
         return self._pose_jumps
 
     def _make_pose(self, rx, rf, yaw, confidence):
+        """Build a pose dict in ROVER-CENTRE coordinates.
+
+        The T265 reports ITS OWN position. Mounted off the turn centre it traces
+        an arc when the rover rotates in place and reports that as translation,
+        so the believed rover position (and every target projected from it)
+        swings on each heading correction. Subtract the lever arm, rotated into
+        the world frame by the current heading, and pure rotation leaves the
+        reported position unchanged — which is what physically happens.
+        """
+        ox, oz = self.cfg.SENSOR_OFFSET_RIGHT, self.cfg.SENSOR_OFFSET_FWD
+        if ox or oz:
+            c, sn = math.cos(yaw), math.sin(yaw)
+            # same (right, forward) rotation convention the navigator uses
+            rx -= ox * c + oz * sn
+            rf -= -ox * sn + oz * c
         return {"_now": time.monotonic(), "rx": rx, "rf": rf,
                 "yaw": yaw, "confidence": confidence}
 
@@ -615,6 +710,13 @@ class T265RoverService:
             with self._lock:
                 out = self._tick(time.monotonic())
                 self._out = out
+                # "Commanded stationary" = we are publishing (near) zero body
+                # velocity. _filter_pose uses this to decide whether a large
+                # pose step can possibly be real motion (it cannot, while still)
+                # or must be a T265 relocalisation worth accepting.
+                self._cmd_still = (abs(out[0]) < self.cfg.POSE_STILL_EPS
+                                   and abs(out[1]) < self.cfg.POSE_STILL_EPS
+                                   and abs(out[2]) < self.cfg.POSE_STILL_EPS)
             self._publish_now(out)
             self._stop.wait(period)
         self._publish_now((0.0, 0.0, 0.0))   # final safety stop
@@ -634,6 +736,27 @@ class T265RoverService:
         err_r = goal.right - right
         err_f = goal.forward - forward
         dist = math.hypot(err_r, err_f)
+
+        # Stall watchdog: fail fast if the remaining distance-to-goal hasn't
+        # meaningfully improved in a while, whether that's because the rover
+        # isn't actually moving despite being commanded to (stuck, e-stop,
+        # motor fault) or because tracking is lost and never recovers. This
+        # runs well ahead of the worst-case deadline below so a dead move
+        # clears quickly instead of blocking new commands behind it.
+        # NOTE: once position is inside tolerance the rover deliberately stops
+        # translating and rotates in place to settle heading, so distance stops
+        # improving BY DESIGN. best_dist is the minimum ever seen, so that phase
+        # can never improve it and would otherwise burn the whole stall budget —
+        # a leg that arrived correctly then failed as "stalled" while doing
+        # exactly what it was told. Hold the timer while position is good.
+        if dist <= self.cfg.POS_TOL:
+            goal.best_dist_t = now
+        if goal.best_dist is None or dist <= goal.best_dist - self.cfg.STALL_MIN_PROGRESS_M:
+            goal.best_dist = dist
+            goal.best_dist_t = now
+        elif now - goal.best_dist_t >= self.cfg.STALL_TIMEOUT:
+            self._finish(goal, False, "stalled", right, forward)
+            return self._ramp(self._out, (0.0, 0.0, 0.0))
 
         # Tracking lost -> hold still (the deadline still applies as a backstop).
         if not self._mock and pose["confidence"] <= self.cfg.LOST_CONF:
@@ -680,14 +803,40 @@ class T265RoverService:
                     or now - goal.pos_since >= self.cfg.ARRIVE_SETTLE_TIMEOUT):
                 self._finish(goal, True, "arrived", right, forward)
                 return self._ramp(self._out, (0.0, 0.0, 0.0))
-            return self._ramp(self._out, (0.0, 0.0, wz))
+            # Rotate to settle heading, but KEEP nudging position at the same
+            # time. Commanding pure rotation here used to create a mode flip:
+            # any drift during the spin pushed position back outside tolerance,
+            # the controller switched to translating, which disturbed heading,
+            # and it oscillated between the two. Use the bare proportional term
+            # with NO stiction floor or boost, so this is a gentle trim (a 10 mm
+            # error asks for 0.015 m/s) rather than a fresh full-speed run.
+            trim = _clamp(self.cfg.LINEAR_GAIN * dist, 0.0, self.cfg.MAX_LINEAR)
+            if dist > 1e-6:
+                tf, tr = (err_f / dist) * trim, (err_r / dist) * trim
+            else:
+                tf = tr = 0.0
+            return self._ramp(self._out, (tf, tr, wz))
 
         # Translate straight toward the goal: one speed along the error vector
         # (so a diagonal and a straight move behave identically). Speed is
         # proportional to remaining distance — easing in near the goal — but
         # floored at MIN_LINEAR so the final stretch runs at an executable speed
         # rather than an asymptotic crawl, and capped at MAX_LINEAR.
-        speed = _clamp(self.cfg.LINEAR_GAIN * dist, self.cfg.MIN_LINEAR, self.cfg.MAX_LINEAR)
+        # Stiction integral: pure P has no authority to break static friction —
+        # if the floor speed doesn't move the base, it never rises. Accrue time
+        # spent commanded-but-not-closing, and add a bounded boost. Integrating
+        # TIME-STUCK rather than distance-error means it contributes nothing
+        # during normal cruise, so it cannot wind up and overshoot at the end.
+        dt_i = max(now - goal.prev_t, 1e-3)
+        closing = ((goal.prev_dist - dist) / dt_i) if goal.prev_dist is not None else 0.0
+        goal.prev_dist, goal.prev_t = dist, now
+        if closing < self.cfg.LIN_STICTION_EPS:
+            goal.lin_i += dt_i                                   # stuck: build
+        else:
+            goal.lin_i = max(0.0, goal.lin_i - self.cfg.LIN_I_BLEED * dt_i)   # moving: bleed
+        boost = min(self.cfg.LIN_IGAIN * goal.lin_i, self.cfg.LIN_I_MAX)
+        speed = _clamp(self.cfg.LINEAR_GAIN * dist + boost,
+                       self.cfg.MIN_LINEAR, self.cfg.MAX_LINEAR)
         vr = speed * err_r / dist
         vf = speed * err_f / dist
         # Cross-axis stiffening: the minor axis only gets its error-share of
@@ -743,19 +892,31 @@ class T265RoverService:
     def _yaw_cmd(self, yaw_err, dt):
         """PI yaw rate to drive the heading error to zero (CCW+).
 
-        The integral nulls a constant rotational bias so heading returns *fully*
-        to the start, not just within the P deadband. The accumulator is frozen
-        inside the deadband (no hunting on noise; it just holds the offset) and
-        clamped (anti-windup). Reset at the start of each move.
+        The integral nulls a constant rotational bias (a base that creeps while
+        strafing) so heading returns fully, not just to the edge of the P
+        deadband. Clamped for anti-windup and reset at the start of each move.
+
+        Inside the deadband the command is ZEROED OUTRIGHT, and the accumulator
+        is bled away rather than merely frozen. Previously only the P term was
+        dropped there while the integral kept being applied, so once the error
+        fell inside the deadband the rover carried on rotating on stored
+        integral alone with nothing to unwind it: it drove through centre, the
+        error changed sign, the integral wound the other way, and the base sat
+        oscillating left-right in place. A saturated integral commands ~20 deg/s,
+        which crosses the whole deadband in well under a tenth of a second, so
+        the hunting was fast and visible. Zeroing the command inside the band
+        makes "close enough" actually mean stop.
         """
         if abs(yaw_err) >= self.cfg.YAW_DEADBAND:
             self._yaw_i += yaw_err * dt
             i_lim = self.cfg.YAW_I_MAX / max(self.cfg.YAW_IGAIN, 1e-6)
             self._yaw_i = _clamp(self._yaw_i, -i_lim, i_lim)
-            p = self.cfg.YAW_GAIN * yaw_err
+            cmd = self.cfg.YAW_GAIN * yaw_err + self.cfg.YAW_IGAIN * self._yaw_i
         else:
-            p = 0.0
-        cmd = p + self.cfg.YAW_IGAIN * self._yaw_i
+            # Settled: command nothing, and bleed the accumulator so a stale
+            # integral cannot kick the base once the error next leaves the band.
+            self._yaw_i -= self._yaw_i * min(1.0, self.cfg.YAW_I_BLEED * dt)
+            cmd = 0.0
         return _clamp(cmd, -self.cfg.MAX_YAW, self.cfg.MAX_YAW)
 
     def _ramp(self, cur, target):
