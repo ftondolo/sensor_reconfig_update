@@ -1,4 +1,4 @@
-// Shared BEV map renderer for demo_v1 (audience + operator pages).
+// Shared BEV map renderer (audience + operator pages).
 //
 // Map frame: mm, x right, z DOWN (matches map.json / rectilinear_mm.py).
 // The canvas draws the map 1:1 in that orientation, so the rover (which heads
@@ -8,6 +8,8 @@
 //   view.setMap(mapPayload);        // from GET /api/map
 //   view.setNav(navState);          // from ws "nav" payloads
 //   view.onClick = (x_mm, z_mm) => {...};   // optional (operator page)
+//   view.onRoverDrag = (x_mm, z_mm) => {...};   // optional (operator page):
+//     fires on drop when the rover icon itself was dragged to a new spot.
 //
 // The renderer runs its own requestAnimationFrame loop (target pulse etc).
 
@@ -19,8 +21,40 @@ class BevMap {
     this.nav = null;       // {rover, target, goal, path, status, ...}
     this.trail = [];       // recent rover positions [[x,z,t]]
     this.onClick = null;
+    this.onRoverDrag = null;
+    this._dragging = false;    // dragging the rover icon (vs. a plain click)
+    this._dragPos = null;      // live [x,z] mm while dragging
+    this._justDragged = false; // suppresses the click that follows a drag's pointerup
 
+    canvas.addEventListener("pointerdown", (ev) => {
+      if (!this.onRoverDrag || !this.map || !this.nav || !this.nav.rover) return;
+      const p = this._eventToMap(ev, true);
+      const r = this.nav.rover;
+      const car = this.map.car || { width: 700, length: 750 };
+      const grabR = Math.max(car.width, car.length); // generous grab radius, mm
+      if (Math.hypot(p[0] - r.x, p[1] - r.z) > grabR) return;
+      this._dragging = true;
+      this._dragPos = p;
+      canvas.setPointerCapture(ev.pointerId);
+      ev.preventDefault();
+    });
+    canvas.addEventListener("pointermove", (ev) => {
+      if (!this._dragging) return;
+      this._dragPos = this._eventToMap(ev, true);
+    });
+    canvas.addEventListener("pointerup", (ev) => {
+      if (!this._dragging) return;
+      this._dragging = false;
+      this._justDragged = true;
+      try { canvas.releasePointerCapture(ev.pointerId); } catch (e) { /* ignore */ }
+      const p = this._dragPos;
+      this._dragPos = null;
+      if (p && !this._footprintBlocked(p[0], p[1])) {
+        this.onRoverDrag(Math.round(p[0]), Math.round(p[1]));
+      }
+    });
     canvas.addEventListener("click", (ev) => {
+      if (this._justDragged) { this._justDragged = false; return; }
       if (!this.onClick || !this.map) return;
       const p = this._eventToMap(ev);
       if (p) this.onClick(p[0], p[1]);
@@ -61,14 +95,38 @@ class BevMap {
 
   _px(f, x, z) { return [f.ox + x * f.s, f.oy + z * f.s]; }
 
-  _eventToMap(ev) {
+  // clamp=true keeps returning a point (clamped into the map) instead of null
+  // when the pointer strays outside the canvas/map — needed so a drag preview
+  // keeps following the cursor smoothly even past the edge.
+  _eventToMap(ev, clamp) {
     const rect = this.canvas.getBoundingClientRect();
     const cx = (ev.clientX - rect.left) * (this.canvas.width / rect.width);
     const cy = (ev.clientY - rect.top) * (this.canvas.height / rect.height);
     const f = this._fit();
-    const x = (cx - f.ox) / f.s, z = (cy - f.oy) / f.s;
+    let x = (cx - f.ox) / f.s, z = (cy - f.oy) / f.s;
+    if (clamp) {
+      x = Math.max(0, Math.min(this.map.size.width, x));
+      z = Math.max(0, Math.min(this.map.size.depth, z));
+      return [x, z];
+    }
     if (x < 0 || z < 0 || x > this.map.size.width || z > this.map.size.depth) return null;
     return [x, z];
+  }
+
+  // Same overlap test the rover-footprint render uses to turn red: would a
+  // car-sized rectangle centered at (x, z) overlap any obstacle's clearance
+  // halo? Used to block dropping the dragged rover into a keep-out.
+  _footprintBlocked(x, z) {
+    const car = this.map.car || { width: 700, length: 750 };
+    const cw2 = car.width / 2, cl2 = car.length / 2;
+    const clr = this.map.clearance || 0;
+    for (const o of (this.map.obstacles || [])) {
+      if (x + cw2 > o.x - clr && x - cw2 < o.x + o.w + clr &&
+          z + cl2 > o.z - clr && z - cl2 < o.z + o.h + clr) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // ---- drawing ----------------------------------------------------------
@@ -85,8 +143,8 @@ class BevMap {
     c.fillStyle = "#0b1018";
     c.fillRect(x0, y0, x1 - x0, y1 - y0);
 
-    // 1 m grid
-    c.strokeStyle = "#18202c"; c.lineWidth = 1;
+    // 1 m grid (solid white, not grey — readable on a projector)
+    c.strokeStyle = "#ffffff"; c.lineWidth = 1;
     c.beginPath();
     for (let gx = 0; gx <= mw; gx += 1000) {
       const [px] = this._px(f, gx, 0);
@@ -99,7 +157,7 @@ class BevMap {
     c.stroke();
 
     // axis labels (meters)
-    c.fillStyle = "#3a4150"; c.font = "10px sans-serif";
+    c.fillStyle = "#ffffff"; c.font = "10px sans-serif";
     for (let gx = 0; gx <= mw; gx += 1000) {
       const [px] = this._px(f, gx, 0);
       c.fillText((gx / 1000) + "m", px + 2, y1 + 12);
@@ -134,8 +192,21 @@ class BevMap {
       c.strokeRect(px, pz, qx - px, qz - pz);
     }
 
-    // border
-    c.strokeStyle = "#2b3648"; c.lineWidth = 2;
+    // configured start cell (map.json rover_start): a hollow home marker so the
+    // operator can see where "Return to start" / re-anchor will target.
+    const start = this.map.rover_start;
+    if (start && start.x != null) {
+      const [sx, sz] = this._px(f, start.x, start.z);
+      c.strokeStyle = "rgba(63,185,80,.7)"; c.lineWidth = 2;
+      c.beginPath();
+      c.moveTo(sx - 7, sz + 6); c.lineTo(sx - 7, sz - 2); c.lineTo(sx, sz - 8);
+      c.lineTo(sx + 7, sz - 2); c.lineTo(sx + 7, sz + 6); c.closePath();
+      c.stroke();
+      this._label(c, sx, sz + 18, "START", "rgba(63,185,80,.85)");
+    }
+
+    // border (solid white, not grey)
+    c.strokeStyle = "#ffffff"; c.lineWidth = 2;
     c.strokeRect(x0, y0, x1 - x0, y1 - y0);
 
     const nav = this.nav || {};
@@ -197,7 +268,9 @@ class BevMap {
     if (nav.target) {
       const [tx, tz] = this._px(f, nav.target.x, nav.target.z);
       const stale = !!nav.target.stale;
-      const col = stale ? "rgba(139,151,168,.8)" : "#f85149";
+      // stale = solid white rather than grey; the missing pulse ring below
+      // (and the "last seen" label) still distinguish it from a live target.
+      const col = stale ? "#ffffff" : "#f85149";
       const pulse = 6 + 4 * (0.5 + 0.5 * Math.sin(performance.now() / 280));
       if (!stale) {
         c.strokeStyle = "rgba(248,81,73,.45)"; c.lineWidth = 2;
@@ -244,6 +317,28 @@ class BevMap {
       c.closePath(); c.fill();
       c.restore();
       this._label(c, rx, rz + l2 + 14, "ROVER", "#9ecbff");
+    }
+
+    // drag-in-progress preview: a translucent rover outline following the
+    // pointer (red if the drop point would land in an obstacle keep-out),
+    // drawn at the live rover's current heading since a drag doesn't change
+    // orientation, only position.
+    if (this._dragging && this._dragPos) {
+      const [dx, dz] = this._dragPos;
+      const blocked = this._footprintBlocked(dx, dz);
+      const [px, pz] = this._px(f, dx, dz);
+      const w2 = (car.width / 2) * f.s, l2 = (car.length / 2) * f.s;
+      const yaw = ((nav.rover && nav.rover.yaw_deg) || 0) * Math.PI / 180;
+      c.save();
+      c.globalAlpha = 0.6;
+      c.translate(px, pz);
+      c.rotate(yaw);
+      c.fillStyle = blocked ? "rgba(248,81,73,.9)" : "rgba(47,129,247,.85)";
+      c.strokeStyle = blocked ? "#ffb3ad" : "#9ecbff"; c.lineWidth = 1.5;
+      c.setLineDash([4, 3]);
+      this._roundRect(c, -w2, -l2, 2 * w2, 2 * l2, Math.min(5, w2 / 2));
+      c.fill(); c.stroke();
+      c.restore();
     }
   }
 
