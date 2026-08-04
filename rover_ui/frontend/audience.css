@@ -4,7 +4,7 @@
   --panel2: #161d28;
   --border: #232c3a;
   --text: #eef3f9;
-  --muted: #8b97a8;
+  --muted: #ffffff;
   --rgb: #2f81f7;
   --thermal: #f0883e;
   --radar: #3fb950;
@@ -91,7 +91,14 @@ html, body {
 .cam-card {
   background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
   display: flex; flex-direction: column; overflow: hidden; min-height: 0;
+  transition: border-color .3s ease;
 }
+/* Highlights the cam-card of whichever sensor is currently driving the
+   detection box (mirrors _box_color's blue/green/orange in detector.py,
+   without touching that logic). */
+.cam-card.driving-rgb { border-color: var(--rgb); }
+.cam-card.driving-thermal { border-color: var(--radar); }
+.cam-card.driving-radar { border-color: var(--thermal); }
 .cam-head {
   display: flex; justify-content: space-between; align-items: center;
   padding: 8px 14px; font-size: 14px; font-weight: 600;
@@ -184,8 +191,8 @@ html, body {
   box-shadow: 0 0 10px rgba(47,129,247,.55);
 }
 .thermT .tier.active {
-  background: rgba(240,136,62,.28); border-color: var(--thermal); color: #ffe8d6;
-  box-shadow: 0 0 10px rgba(240,136,62,.55);
+  background: rgba(63,185,80,.28); border-color: var(--radar); color: #d8ffe3;
+  box-shadow: 0 0 10px rgba(63,185,80,.55);
 }
 
 /* contribution bars */
@@ -249,6 +256,14 @@ html, body {
 .btn.small { padding: 7px 8px; font-size: 12.5px; }
 .btn:disabled { opacity: .45; cursor: default; }
 .btn-row { display: flex; gap: 8px; margin-bottom: 8px; }
+.start-pos-row { align-items: center; flex-wrap: wrap; }
+.start-pos-row label { font-size: 12.5px; color: var(--muted); }
+.start-pos-row input[type="number"] {
+  width: 64px; padding: 6px 7px; font-size: 12.5px;
+  background: var(--panel, #11161f); color: inherit;
+  border: 1px solid var(--border); border-radius: 6px;
+}
+.start-pos-row .btn { margin-left: auto; }
 .toggle-on { border-color: var(--green); color: #d8ffe3; background: rgba(63,185,80,.16); }
 .nudge {
   display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
