@@ -1,4 +1,4 @@
-// Audience display (demo_v1) — read-only view of the map-navigation demo.
+// Audience display — read-only view of the map-navigation demo.
 //
 //   * Big BEV map: pre-marked obstacles, live rover footprint, projected
 //     detection target, standoff goal, planned rectilinear path.
@@ -25,6 +25,12 @@ function fmtMM(p) {
   return `(${(p.x / 1000).toFixed(2)}, ${(p.z / 1000).toFixed(2)}) m`;
 }
 
+function fmtAccum(a) {
+  if (!a || !a.phase || a.phase === "none") return "—";
+  if (a.phase === "accumulating") return `accumulating ${a.n}/${a.need}`;
+  return "confirmed";
+}
+
 function updateNav(nav) {
   if (!nav) return;
   bev.setNav(nav);
@@ -45,6 +51,7 @@ function updateNav(nav) {
   $("goal-xy").textContent = fmtMM(nav.goal) + (nav.goal && nav.goal.adjusted ? " (adj)" : "");
   $("nav-leg").textContent = nav.path ? `${nav.leg}/${nav.path.length - 1}` : "—";
   $("pose-src").textContent = nav.mock ? "MOCK" : "T265";
+  $("nav-accum").textContent = fmtAccum(nav.accum);
   $("nav-auto").textContent = nav.auto ? "on" : "off";
   const fol = $("nav-follow");
   fol.textContent = nav.follow ? "ON" : "off";
@@ -77,10 +84,10 @@ function drawMmwave(mm) {
   const ox = W / 2, oy = H - 12;
   const scale = (H - 24) / maxRange;
 
-  c.strokeStyle = "#1c2430"; c.lineWidth = 1;
+  c.strokeStyle = "#ffffff"; c.lineWidth = 1;
   for (let r = 1; r <= maxRange; r++) {
     c.beginPath(); c.arc(ox, oy, r * scale, Math.PI, 2 * Math.PI); c.stroke();
-    c.fillStyle = "#3a4150"; c.font = "10px sans-serif";
+    c.fillStyle = "#ffffff"; c.font = "10px sans-serif";
     c.fillText(r + "m", ox + 3, oy - r * scale + 12);
   }
   if (points) {
@@ -108,7 +115,7 @@ function drawMmwave(mm) {
     c.fillText(`RADAR ${radarBox.range.toFixed(1)}m`, tx - half, ty - half - 4);
   }
 
-  c.fillStyle = "#8b949e";
+  c.fillStyle = "#ffffff";
   c.beginPath(); c.arc(ox, oy, 5, 0, Math.PI * 2); c.fill();
 
   if (suppressed === "moving") {
@@ -131,6 +138,28 @@ function setBadge(id, status) {
 
 // --------------------------------------------------------- detection panel
 function pct(v) { return Math.round((v || 0) * 100); }
+
+// Mirrors detector.py's _box_color() selection rule exactly (radar-only flag
+// first, else the argmax of contrib [rgb, thermal, radar]) so the cam-card
+// highlight always agrees with the box color drawn on the RGB stream --
+// without touching that drawing logic at all.
+function drivingSensor(d) {
+  if (!d) return null;
+  if (d.radar) return "radar";
+  const c = d.contrib || [0, 0, 0];
+  if (!c.some((v) => v)) return "rgb";
+  let idx = 0;
+  for (let i = 1; i < 3; i++) if (c[i] > c[idx]) idx = i;
+  return ["rgb", "thermal", "radar"][idx];
+}
+
+function highlightCamCard(sensor) {
+  const cards = { rgb: "card-rgb", thermal: "card-thermal", radar: "card-radar" };
+  for (const key in cards) {
+    const el = $(cards[key]);
+    if (el) el.classList.toggle("driving-" + key, sensor === key);
+  }
+}
 
 function updateContrib(det) {
   const c = det.contrib || [0, 0, 0];
@@ -163,7 +192,10 @@ function updateContrib(det) {
   setTier("tiers-rgb", a.rgb_res);
   setTier("tiers-therm", a.therm_res);
 
-  renderDetList(det.detections || []);
+  const dets = det.detections || [];
+  highlightCamCard(dets.length ? drivingSensor(dets[0]) : null);
+
+  renderDetList(dets);
 }
 
 function setTier(containerId, label) {
