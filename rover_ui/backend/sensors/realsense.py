@@ -48,6 +48,11 @@ class D435iRGB(SensorThread):
         self._depth_enabled = bool(config.D435_ENABLE_DEPTH)
         self._depth_cmap = _DEPTH_COLORMAPS.get(config.D435_DEPTH_COLORMAP, 2)
         self._depth_scale = 0.001  # m per unit; refined from the device at open()
+        # Colour intrinsics, filled in at open() from the device. Stay None in
+        # mock mode / before the pipeline starts, which is how the tag
+        # localiser knows to disable itself rather than solve with a guess.
+        self.color_K = None
+        self.color_dist = None
         # Side-channel buffers: the raw BGR color frame (for the detector), a
         # colormapped depth JPEG (for the audience MJPEG stream), and the
         # color-ALIGNED raw 16-bit depth as (uint16 array, meters_per_unit) so
@@ -81,6 +86,24 @@ class D435iRGB(SensorThread):
                 rs.format.z16, config.D435_FPS,
             )
         profile = pipe.start(cfg)
+        # Colour intrinsics, ALWAYS. The tag localiser needs the real camera
+        # matrix, and it must not depend on depth being enabled or on the
+        # depth-align LUT succeeding: both are optional and the LUT build is
+        # wrapped in a try/except, so piggy-backing on it meant a single
+        # unrelated failure silently disabled tag localisation entirely.
+        try:
+            cprof = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            ci = cprof.get_intrinsics()
+            self.color_K = np.array([[ci.fx, 0.0, ci.ppx],
+                                     [0.0, ci.fy, ci.ppy],
+                                     [0.0, 0.0, 1.0]], np.float64)
+            self.color_dist = np.array(ci.coeffs, np.float64).ravel()
+            print("[D435i] colour intrinsics: fx=%.1f fy=%.1f ppx=%.1f ppy=%.1f"
+                  % (ci.fx, ci.fy, ci.ppx, ci.ppy))
+        except Exception as exc:
+            self.color_K = self.color_dist = None
+            print("[D435i] colour intrinsics unavailable (%s) — TAG LOCALISATION "
+                  "IS DISABLED" % exc)
         if self._depth_enabled:
             try:
                 self._depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
