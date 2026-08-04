@@ -88,6 +88,14 @@ class RadarTrackerConfig:
     min_snr_sum = 0      # the cluster's total reflected energy must exceed this
     # Continuity / maintenance.
     gate_radius = 1.0          # m: associate a candidate to the existing track within this
+    # Acquisition confirmation (ghost gate): a FRESH lock requires the winning
+    # moving cluster to persist within acquire_confirm_radius of itself for
+    # acquire_confirm_s seconds. A transient multipath ghost stops clustering
+    # ~accum_sec after its points cease, so a few-frame ghost never confirms;
+    # a real person's continuous returns do. Keep confirm_s above accum_sec.
+    # 0 = the old instant single-window acquisition. Maintenance is unaffected.
+    acquire_confirm_s = 1.0
+    acquire_confirm_radius = 0.6
     hold_timeout = 1.5         # s: keep a spatially-unsupported track this long, then drop
     pos_smooth = 0.3           # EMA: new-position weight (lower = smoother, more lag)
     # Motion confirmation: a lock must have shown motion within this window or it's
@@ -108,6 +116,7 @@ class RadarTracker:
         self._snr_peak = 0       # reflection intensity of the locked cluster (0.1 dB)
         self._snr_sum = 0
         self._buf = deque()      # accumulation: (t, [roi points])
+        self._pend = None        # pending acquisition {x, y, t0} awaiting confirmation
 
     def _roi(self, points):
         c = self.c
@@ -139,17 +148,45 @@ class RadarTracker:
     def _drop(self):
         self.acquired = False
         self.x = self.y = None
+        self._pend = None
 
-    def _acquire(self, cands):
-        # Acquire ONLY a MOVING cluster -> an empty/static scene never locks on
-        # (clutter reflects as strongly as a person, so SNR can't separate them;
-        # motion can). Most-moving cluster is the human; tiebreak by total SNR.
+    def _qualified(self, cands):
+        # Clusters eligible for a FRESH lock: MOVING and sufficiently reflective,
+        # so an empty/static scene never locks on (clutter reflects as strongly
+        # as a person, so SNR alone can't separate them; motion can).
         c = self.c
-        moving = [st for st in cands if st["max_v"] > c.v_move
-                  and st["snr_peak"] >= c.min_snr_peak and st["snr_sum"] >= c.min_snr_sum]
-        if not moving:
+        return [st for st in cands if st["max_v"] > c.v_move
+                and st["snr_peak"] >= c.min_snr_peak and st["snr_sum"] >= c.min_snr_sum]
+
+    def _acquire(self, cands, t):
+        """Fresh lock with confirmation ("last X positions" ghost gate): the
+        best moving cluster becomes a PENDING candidate and must persist within
+        acquire_confirm_radius of itself for acquire_confirm_s before it is
+        returned as the track. A transient multipath ghost is only clusterable
+        for its own duration + accum_sec, so it never confirms; a real person's
+        continuous returns do (the pending point follows them as they walk).
+        Most-moving cluster is the human; tiebreak by total SNR."""
+        c = self.c
+        qual = self._qualified(cands)
+        if not qual:
+            self._pend = None
             return None
-        return max(moving, key=lambda st: (st["max_v"], st["snr_sum"]))
+        if c.acquire_confirm_s <= 0:      # legacy instant single-window acquire
+            return max(qual, key=lambda st: (st["max_v"], st["snr_sum"]))
+        p = self._pend
+        if p is not None:
+            near = [st for st in qual
+                    if math.hypot(st["xc"] - p["x"], st["yc"] - p["y"]) <= c.acquire_confirm_radius]
+            if near:
+                st = min(near, key=lambda s: math.hypot(s["xc"] - p["x"], s["yc"] - p["y"]))
+                p["x"], p["y"] = st["xc"], st["yc"]   # follow a walking person
+                if (t - p["t0"]) >= c.acquire_confirm_s:
+                    self._pend = None
+                    return st
+                return None
+        best = max(qual, key=lambda st: (st["max_v"], st["snr_sum"]))
+        self._pend = {"x": best["xc"], "y": best["yc"], "t0": t}
+        return None
 
     def update(self, points, t, rover_moving=False):
         c = self.c
@@ -163,7 +200,8 @@ class RadarTracker:
             if near:
                 chosen = min(near, key=lambda st: math.hypot(st["xc"] - self.x, st["yc"] - self.y))
         elif not rover_moving:
-            chosen = self._acquire(cands)   # acquire only a moving cluster, only while still
+            # acquire only a CONFIRMED moving cluster, only while still
+            chosen = self._acquire(cands, t)
 
         if chosen is not None:
             if not self.acquired or self.x is None:
@@ -202,4 +240,5 @@ class RadarTracker:
     def reset(self):
         self.x = self.y = None
         self.acquired = False
+        self._pend = None
         self._buf.clear()
