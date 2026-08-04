@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PATHLAB · Map &amp; Config Editor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#141a22;--ink-soft:#5a6675;--ink-faint:#97a1ad;
+  --paper:#eef1f4;--panel:#fff;--line:#dde3ea;--line-strong:#cdd5de;
+  --obs:#9aa6b4;--obs-edge:#5b6675;--keep:#0f9d8a;--accent:#ff5d2e;
+  --start:#1aa05a;--tag:#7c4dff;--map:#ffffff;--warn:#c2410c;--bad:#b91c1c;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--paper);color:var(--ink);font-family:Inter,system-ui,sans-serif;
+  display:grid;grid-template-columns:372px 1fr;height:100vh;overflow:hidden}
+.panel{background:var(--panel);border-right:1px solid var(--line);padding:18px 20px;overflow-y:auto;display:flex;flex-direction:column;gap:16px}
+.top{display:flex;align-items:center;justify-content:space-between}
+.brand{display:flex;align-items:baseline;gap:8px}
+.brand .dot{width:9px;height:9px;border-radius:2px;background:var(--accent);transform:translateY(-2px)}
+.brand h1{font-family:"Space Grotesk";font-weight:700;font-size:20px;letter-spacing:-.5px;margin:0}
+.brand p{margin:1px 0 0;font-size:11px;color:var(--ink-faint)}
+.lang{border:1px solid var(--line);background:var(--paper);border-radius:8px;font:600 12px Inter;color:var(--ink-soft);padding:6px 11px;cursor:pointer}
+.lang:hover{border-color:var(--line-strong)}
+.sec{display:flex;flex-direction:column;gap:11px;padding-bottom:16px;border-bottom:1px solid var(--line)}
+.sec:last-child{border-bottom:0}
+.sec > .lbl{font-family:"IBM Plex Mono";font-size:10.5px;font-weight:600;letter-spacing:1.4px;text-transform:uppercase;color:var(--ink-faint)}
+.field{display:flex;flex-direction:column;gap:5px}
+.field label{font-size:12px;color:var(--ink-soft);font-weight:500}
+.field input,.field select{border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:600 13px "IBM Plex Mono";color:var(--ink);background:var(--panel);width:100%}
+.field input:focus,.field select:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.grid4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px}
+.seg{display:flex;background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:3px;gap:3px}
+.seg button{flex:1;border:0;background:transparent;color:var(--ink-soft);cursor:pointer;font:600 12.5px Inter;padding:8px 4px;border-radius:6px}
+.seg button[aria-pressed=true]{background:var(--ink);color:#fff}
+.btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);font:600 12.5px Inter;padding:10px;border-radius:8px;cursor:pointer;width:100%}
+.btn:hover{background:var(--paper);border-color:var(--line-strong)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{filter:brightness(1.06)}
+.btn.dark{background:var(--ink);border-color:var(--ink);color:#fff}
+.btn.dark:hover{filter:brightness(1.25)}
+.btn.danger{color:var(--bad);border-color:#f0d0d0}
+.btn.danger:hover{background:#fdf2f2}
+.btn.sm{padding:7px;font-size:11.5px}
+.selbox{border:1px solid var(--line);border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:10px;background:#fbfcfd}
+.selbox.empty{color:var(--ink-faint);font-size:12px;text-align:center;padding:16px}
+.chk{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--ink-soft);cursor:pointer}
+.note{font-size:11px;line-height:1.5;color:var(--ink-faint);background:var(--paper);border-radius:8px;padding:9px 10px}
+.taglist{display:flex;flex-direction:column;gap:6px;max-height:236px;overflow-y:auto}
+.tagrow{display:grid;grid-template-columns:52px 1fr 1fr 1fr 58px 24px;gap:4px;align-items:center}
+.tagrow input,.tagrow select{border:1px solid var(--line);border-radius:6px;padding:5px 6px;font:600 11px "IBM Plex Mono";width:100%;background:#fff}
+.tagrow .x{border:0;background:transparent;color:var(--ink-faint);cursor:pointer;font-size:14px;padding:0}
+.tagrow .x:hover{color:var(--bad)}
+.thead{display:grid;grid-template-columns:52px 1fr 1fr 1fr 58px 24px;gap:4px;font:600 9.5px "IBM Plex Mono";letter-spacing:.6px;color:var(--ink-faint);text-transform:uppercase}
+.issues{display:flex;flex-direction:column;gap:5px;font-size:11.5px;line-height:1.45}
+.issue{padding:7px 9px;border-radius:7px;background:#fff7ed;color:var(--warn);border:1px solid #fed7aa}
+.issue.bad{background:#fef2f2;color:var(--bad);border-color:#fecaca}
+.issue.ok{background:#f0fdf4;color:#15803d;border-color:#bbf7d0}
+.stage{position:relative;overflow:hidden}
+canvas{width:100%;height:100%;display:block}
+#cur{position:absolute;pointer-events:none;background:var(--ink);color:#fff;font:600 10.5px "IBM Plex Mono";
+  padding:3px 6px;border-radius:5px;transform:translate(12px,12px);opacity:0;transition:opacity .12s}
+.legend{position:absolute;left:14px;bottom:12px;display:flex;gap:14px;flex-wrap:wrap;
+  background:rgba(255,255,255,.92);border:1px solid var(--line);border-radius:9px;padding:8px 12px;font-size:11px;color:var(--ink-soft)}
+.legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.hidden{display:none}
+</style>
+
+<div class="panel">
+  <div class="top">
+    <div class="brand"><span class="dot"></span>
+      <div><h1>PATHLAB</h1><p data-i18n="sub">Map &amp; config editor</p></div></div>
+    <button class="lang" id="lang">中文</button>
+  </div>
+
+  <!-- ---------------- load ---------------- -->
+  <div class="sec">
+    <div class="lbl" data-i18n="load_sec">Load existing</div>
+    <div class="grid2">
+      <button class="btn sm" id="impMapBtn" data-i18n="imp_map">↥ map.json</button>
+      <button class="btn sm" id="impCfgBtn" data-i18n="imp_cfg">↥ config.json</button>
+    </div>
+    <input type="file" id="impMap" accept=".json,application/json" class="hidden">
+    <input type="file" id="impCfg" accept=".json,application/json" class="hidden">
+    <div class="note" data-i18n="imp_note">Loads both the current midline schema and the older
+      min-corner one (obstacles carrying their own w/h), converting as it reads.</div>
+  </div>
+
+  <!-- ---------------- arena ---------------- -->
+  <div class="sec">
+    <div class="lbl" data-i18n="map_sec">Arena</div>
+    <div class="grid2">
+      <div class="field"><label data-i18n="map_w">Width X (mm)</label><input type="number" id="mw" value="5000" min="500" step="100"></div>
+      <div class="field"><label data-i18n="map_d">Depth Z (mm)</label><input type="number" id="md" value="6000" min="500" step="100"></div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label data-i18n="st_x">Start X (mm)</label><input type="number" id="sx" value="275" step="25"></div>
+      <div class="field"><label data-i18n="st_z">Start Z (mm)</label><input type="number" id="sz" value="5700" step="25"></div>
+    </div>
+    <div class="seg" id="tool">
+      <button data-tool="select" aria-pressed="true" data-i18n="t_select">Select / Move</button>
+      <button data-tool="add" aria-pressed="false" data-i18n="t_add">Add panel</button>
+      <button data-tool="start" aria-pressed="false" data-i18n="t_start">Set start</button>
+    </div>
+  </div>
+
+  <!-- ---------------- selected obstacle ---------------- -->
+  <div class="sec">
+    <div class="lbl" data-i18n="obs_sec">Panel</div>
+    <div class="selbox empty" id="selEmpty" data-i18n="no_sel">No panel selected</div>
+    <div class="selbox" id="selBox" style="display:none">
+      <div class="grid2">
+        <div class="field"><label data-i18n="o_x">X · −x edge (mm)</label><input type="number" id="ox" step="25"></div>
+        <div class="field"><label data-i18n="o_z">Z · midline (mm)</label><input type="number" id="oz" step="25"></div>
+      </div>
+      <div class="thead"><span data-i18n="th_id">ID</span><span>dx</span><span>dy</span><span>dz</span>
+        <span data-i18n="th_face">Face</span><span></span></div>
+      <div class="taglist" id="taglist"></div>
+      <div class="grid2">
+        <button class="btn sm" id="addTag" data-i18n="add_tag">+ Tag</button>
+        <button class="btn sm" id="add2x2" data-i18n="add_2x2">+ 2×2 set</button>
+      </div>
+      <button class="btn danger" id="delBtn" data-i18n="del">Delete panel</button>
+    </div>
+  </div>
+
+  <!-- ---------------- config ---------------- -->
+  <div class="sec">
+    <div class="lbl" data-i18n="cfg_sec">Config / hyperparameters</div>
+    <div class="grid2">
+      <div class="field"><label data-i18n="car_w">Car width X (mm)</label><input type="number" id="cw" value="550" min="10" step="10"></div>
+      <div class="field"><label data-i18n="car_l">Car length Z (mm)</label><input type="number" id="cl" value="600" min="10" step="10"></div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label data-i18n="os_w">Panel width (mm)</label><input type="number" id="osw" value="1350" min="10" step="10"></div>
+      <div class="field"><label data-i18n="os_h">Panel thickness (mm)</label><input type="number" id="osh" value="40" min="1" step="5"></div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label data-i18n="pad_x">Foot pad X (mm)</label><input type="number" id="padx" value="0" min="0" step="5"></div>
+      <div class="field"><label data-i18n="pad_z">Foot pad Z (mm)</label><input type="number" id="padz" value="155" min="0" step="5"></div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label data-i18n="clr">Clearance (mm)</label><input type="number" id="clr" value="75" min="0" step="5"></div>
+      <div class="field"><label data-i18n="maxclr">Max clearance (mm)</label><input type="number" id="maxclr" value="400" min="0" step="10"></div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label data-i18n="ctol">Clearance tol (mm)</label><input type="number" id="ctol" value="10" min="1" step="1"></div>
+      <div class="field"><label data-i18n="wclr">Wall clearance (mm)</label><input type="number" id="wclr" value="0" min="0" step="5"></div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label data-i18n="tp">Turn penalty (mm)</label><input type="number" id="tp" value="1500" min="0" step="100"></div>
+      <div class="field"><label data-i18n="tsz">Tag size (mm)</label><input type="number" id="tsz" value="190" min="10" step="5"></div>
+    </div>
+    <label class="chk"><input type="checkbox" id="preview" checked> <span data-i18n="prev">Preview car &amp; keep-out</span></label>
+  </div>
+
+  <!-- ---------------- checks ---------------- -->
+  <div class="sec">
+    <div class="lbl" data-i18n="chk_sec">Checks</div>
+    <div class="issues" id="issues"></div>
+  </div>
+
+  <!-- ---------------- export ---------------- -->
+  <div class="sec">
+    <div class="lbl" data-i18n="exp_sec">Export</div>
+    <button class="btn primary" id="expMap" data-i18n="exp_map">⬇ Export map.json</button>
+    <button class="btn dark" id="expCfg" data-i18n="exp_cfg">⬇ Export config.json</button>
+    <div class="note" data-i18n="note">X = left/right (right +). Z = forward/back; the rover faces
+      −Z, so its camera sees panel faces on the +Z side. A panel is anchored at its −x edge on the
+      z MIDLINE, and every panel shares one size. Tag dx/dy/dz are measured from the panel's
+      ground-centre: dy is height above the floor. All values in millimetres.</div>
+  </div>
+</div>
+
+<div class="stage">
+  <canvas id="cv"></canvas>
+  <div id="cur"></div>
+  <div class="legend">
+    <span><i style="background:var(--obs)"></i><span data-i18n="lg_keep">keep-out (wall + feet)</span></span>
+    <span><i style="background:var(--obs-edge)"></i><span data-i18n="lg_wall">wall</span></span>
+    <span><i style="background:var(--keep)"></i><span data-i18n="lg_infl">planner inflation</span></span>
+    <span><i style="background:var(--tag)"></i><span data-i18n="lg_tag">tag</span></span>
+    <span><i style="background:var(--start)"></i><span data-i18n="lg_start">rover start</span></span>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ---------------------------------------------------------------------------
+   Schema this tool reads and writes (must match the running codebase):
+
+   config.json                          map.json
+     car:{width,length}                   size:{width,depth}
+     obstacle_size:{w,h}   <- the WALL    obstacles:[{x,z,tags:[...]}]
+     obstacle_pad:{x,z}    <- the FEET      x = the panel's -x edge
+     clearance                              z = the panel's z MIDLINE
+     max_clearance                        rover_start:{x,z}
+     clearance_tolerance                  tag_size_mm
+     wall_clearance
+     turn_penalty
+
+   Obstacles no longer carry w/h: every panel is the same size, held once in
+   config.json. The collision box the planner avoids is the wall grown by the
+   foot pad; the bare wall is what the camera sees and what tags are stuck to.
+   A tag's world position is (x + W/2 + dx, dy, z + dz).
+--------------------------------------------------------------------------- */
+
+const I18N={
+  sub:{en:"Map & config editor",zh:"地图与配置编辑器"},
+  load_sec:{en:"Load existing",zh:"载入现有文件"},
+  imp_map:{en:"↥ map.json",zh:"↥ map.json"},
+  imp_cfg:{en:"↥ config.json",zh:"↥ config.json"},
+  imp_note:{en:"Loads both the current midline schema and the older min-corner one (obstacles carrying their own w/h), converting as it reads.",
+            zh:"同时支持当前的中线格式与旧的最小角格式（障碍自带 w/h），载入时自动转换。"},
+  map_sec:{en:"Arena",zh:"场地"},
+  map_w:{en:"Width X (mm)",zh:"宽度 X (mm)"},
+  map_d:{en:"Depth Z (mm)",zh:"纵深 Z (mm)"},
+  st_x:{en:"Start X (mm)",zh:"起点 X (mm)"},
+  st_z:{en:"Start Z (mm)",zh:"起点 Z (mm)"},
+  t_select:{en:"Select / Move",zh:"选择 / 移动"},
+  t_add:{en:"Add panel",zh:"添加挡板"},
+  t_start:{en:"Set start",zh:"设置起点"},
+  obs_sec:{en:"Panel",zh:"挡板"},
+  no_sel:{en:"No panel selected",zh:"未选中挡板"},
+  o_x:{en:"X · −x edge (mm)",zh:"X · −x 边 (mm)"},
+  o_z:{en:"Z · midline (mm)",zh:"Z · 中线 (mm)"},
+  th_id:{en:"ID",zh:"编号"},th_face:{en:"Face",zh:"朝向"},
+  add_tag:{en:"+ Tag",zh:"+ 标签"},
+  add_2x2:{en:"+ 2×2 set",zh:"+ 2×2 组"},
+  del:{en:"Delete panel",zh:"删除挡板"},
+  cfg_sec:{en:"Config / hyperparameters",zh:"配置 / 超参数"},
+  car_w:{en:"Car width X (mm)",zh:"车宽 X (mm)"},
+  car_l:{en:"Car length Z (mm)",zh:"车长 Z (mm)"},
+  os_w:{en:"Panel width (mm)",zh:"挡板宽 (mm)"},
+  os_h:{en:"Panel thickness (mm)",zh:"挡板厚 (mm)"},
+  pad_x:{en:"Foot pad X (mm)",zh:"支脚外扩 X (mm)"},
+  pad_z:{en:"Foot pad Z (mm)",zh:"支脚外扩 Z (mm)"},
+  clr:{en:"Clearance (mm)",zh:"扩张边界 (mm)"},
+  maxclr:{en:"Max clearance (mm)",zh:"最大扩张 (mm)"},
+  ctol:{en:"Clearance tol (mm)",zh:"扩张搜索精度 (mm)"},
+  wclr:{en:"Wall clearance (mm)",zh:"墙面余量 (mm)"},
+  tp:{en:"Turn penalty (mm)",zh:"转弯惩罚 (mm)"},
+  tsz:{en:"Tag size (mm)",zh:"标签边长 (mm)"},
+  prev:{en:"Preview car & keep-out",zh:"预览车体与禁入区"},
+  chk_sec:{en:"Checks",zh:"检查"},
+  exp_sec:{en:"Export",zh:"导出"},
+  exp_map:{en:"⬇ Export map.json",zh:"⬇ 导出 map.json"},
+  exp_cfg:{en:"⬇ Export config.json",zh:"⬇ 导出 config.json"},
+  note:{en:"X = left/right (right +). Z = forward/back; the rover faces −Z, so its camera sees panel faces on the +Z side. A panel is anchored at its −x edge on the z MIDLINE, and every panel shares one size. Tag dx/dy/dz are measured from the panel's ground-centre: dy is height above the floor. All values in millimetres.",
+        zh:"X = 左右（右为正）。Z = 前后；车头朝 −Z，相机看到的是挡板 +Z 一侧。挡板以 −x 边、z 中线定位，所有挡板共用同一尺寸。标签 dx/dy/dz 相对挡板底面中心，dy 为离地高度。单位均为毫米。"},
+  lg_keep:{en:"keep-out (wall + feet)",zh:"禁入区（板+支脚）"},
+  lg_wall:{en:"wall",zh:"板面"},
+  lg_infl:{en:"planner inflation",zh:"规划扩张"},
+  lg_tag:{en:"tag",zh:"标签"},
+  lg_start:{en:"rover start",zh:"车辆起点"},
+  fwd:{en:"forward (−Z)",zh:"前 (−Z)"},
+  ok:{en:"No problems found.",zh:"未发现问题。"},
+};
+let lang="en";
+function applyLang(){
+  document.querySelectorAll("[data-i18n]").forEach(el=>{el.innerHTML=I18N[el.dataset.i18n][lang];});
+  document.documentElement.lang=lang;
+  document.getElementById("lang").textContent=lang==="en"?"中文":"EN";
+  dirty=true;refreshTags();validate();
+}
+document.getElementById("lang").onclick=()=>{lang=lang==="en"?"zh":"en";applyLang();};
+
+// ---------------------------------------------------------------- state
+const cv=document.getElementById("cv"),ctx=cv.getContext("2d");
+let W=0,H=0,DPR=1,scale=1,offx=0,offy=0,dirty=true;
+const map={width:5000,depth:6000,obstacles:[],start:{x:275,z:5700},tagSize:190};
+const cfg={cw:550,cl:600,osw:1350,osh:40,padx:0,padz:155,
+           clr:75,maxclr:400,ctol:10,wclr:0,tp:1500};
+let tool="select",selected=-1,preview=true;
+
+// The 20 best-separated DICT_4X4_50 ids (max-min Hamming distance over all
+// rotations). Using these rather than 0..19 buys real error-correction margin.
+const GOOD_IDS=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,17,18,22,35];
+
+function demo(){
+  map.obstacles=[
+    {x:182,z:4398,tags:[]},{x:1752,z:4403,tags:[]},{x:3277,z:2324,tags:[]},
+    {x:1829,z:1424,tags:[]},{x:189,z:562,tags:[]}];
+  map.obstacles.forEach((o,i)=>add2x2(o,i*4));
+}
+// ---- geometry helpers (mirror rectilinear_mm.obstacle_boxes) ----
+function wallRect(o){return {x:o.x,z:o.z-cfg.osh/2,w:cfg.osw,h:cfg.osh};}
+function keepRect(o){const r=wallRect(o);
+  return {x:r.x-cfg.padx,z:r.z-cfg.padz,w:r.w+2*cfg.padx,h:r.h+2*cfg.padz};}
+function tagWorld(o,t){return {x:o.x+cfg.osw/2+(+t.dx||0), z:o.z+(+t.dz||0), y:+t.dy||0};}
+
+function add2x2(o,base){
+  // Tags are stuck to the WALL, not to the stabiliser feet: the feet sit at the
+  // panel ends (an H in plan), leaving the middle of the face exposed. So the
+  // default dz is the wall half-thickness plus a few mm for the mount, NOT the
+  // foot pad — putting it on the foot line would place every tag ~150 mm
+  // behind where it physically is.
+  const dz=Math.round(cfg.osh/2+5);
+  const dx=Math.min(550,Math.max(50,cfg.osw/2-map.tagSize/2-35));
+  o.tags=[{id:base+0,dx:-dx,dy:1500,dz:dz,facing:"+z"},
+          {id:base+1,dx: dx,dy:1500,dz:dz,facing:"+z"},
+          {id:base+2,dx:-dx,dy:1000,dz:dz,facing:"+z"},
+          {id:base+3,dx: dx,dy:1000,dz:dz,facing:"+z"}];
+}
+function nextFreeIds(n){
+  const used=new Set();map.obstacles.forEach(o=>o.tags.forEach(t=>used.add(+t.id)));
+  const out=[];for(const id of GOOD_IDS){if(out.length>=n)break;if(!used.has(id))out.push(id);}
+  let k=0;while(out.length<n){if(!used.has(k)&&!out.includes(k))out.push(k);k++;}
+  return out;
+}
+
+// ---------------------------------------------------------------- canvas
+function fit(){const pad=52;scale=Math.min((W-2*pad)/map.width,(H-2*pad)/map.depth);
+  offx=(W-map.width*scale)/2;offy=(H-map.depth*scale)/2;}
+function resize(){const r=cv.getBoundingClientRect();DPR=window.devicePixelRatio||1;
+  const first=W===0;W=r.width;H=r.height;cv.width=W*DPR;cv.height=H*DPR;ctx.setTransform(DPR,0,0,DPR,0,0);
+  if(first){demo();syncInputs();}
+  fit();dirty=true;}
+const X=x=>offx+x*scale, Z=z=>offy+z*scale, iX=p=>(p-offx)/scale, iZ=p=>(p-offy)/scale;
+const cc={};function getC(v){return cc[v]||(cc[v]=getComputedStyle(document.documentElement).getPropertyValue(v).trim());}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle="#ffffff";ctx.fillRect(X(0),Z(0),map.width*scale,map.depth*scale);
+  ctx.strokeStyle="#eaeef2";ctx.lineWidth=1;ctx.beginPath();
+  for(let x=0;x<=map.width;x+=1000){ctx.moveTo(X(x),Z(0));ctx.lineTo(X(x),Z(map.depth));}
+  for(let z=0;z<=map.depth;z+=1000){ctx.moveTo(X(0),Z(z));ctx.lineTo(X(map.width),Z(z));}ctx.stroke();
+  ctx.strokeStyle=getC("--line-strong");ctx.lineWidth=1.5;
+  ctx.strokeRect(X(0),Z(0),map.width*scale,map.depth*scale);
+
+  // forward arrow (the rover drives toward -Z)
+  ctx.strokeStyle=getC("--ink-faint");ctx.fillStyle=getC("--ink-faint");ctx.lineWidth=1.5;
+  const ax=X(0)-28,a0=Z(map.depth)-10,a1=Z(0)+14;
+  if(ax>6){ctx.beginPath();ctx.moveTo(ax,a0);ctx.lineTo(ax,a1);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(ax,a1-1);ctx.lineTo(ax-4,a1+7);ctx.lineTo(ax+4,a1+7);ctx.closePath();ctx.fill();
+    ctx.save();ctx.translate(ax-9,(a0+a1)/2);ctx.rotate(-Math.PI/2);ctx.font='10px "IBM Plex Mono"';
+    ctx.textAlign="center";ctx.fillText(I18N.fwd[lang],0,0);ctx.restore();}
+
+  // planner inflation = keep-out grown by car half-extent + clearance
+  if(preview){const mx=cfg.cw/2+cfg.clr,mz=cfg.cl/2+cfg.clr;
+    ctx.strokeStyle=getC("--keep");ctx.lineWidth=1.3;ctx.setLineDash([6,4]);
+    for(const o of map.obstacles){const k=keepRect(o);
+      ctx.strokeRect(X(k.x-mx),Z(k.z-mz),(k.w+2*mx)*scale,(k.h+2*mz)*scale);}
+    ctx.setLineDash([]);}
+
+  for(let i=0;i<map.obstacles.length;i++){
+    const o=map.obstacles[i],k=keepRect(o),w=wallRect(o);
+    ctx.fillStyle=getC("--obs");ctx.globalAlpha=.5;
+    ctx.fillRect(X(k.x),Z(k.z),k.w*scale,k.h*scale);ctx.globalAlpha=1;
+    ctx.strokeStyle=getC("--obs");ctx.lineWidth=1;
+    ctx.strokeRect(X(k.x),Z(k.z),k.w*scale,k.h*scale);
+    // the wall itself, drawn solid so it reads as the surface the camera sees
+    ctx.fillStyle=getC("--obs-edge");
+    ctx.fillRect(X(w.x),Z(w.z),w.w*scale,Math.max(2,w.h*scale));
+    // tags
+    for(const t of o.tags){const p=tagWorld(o,t);
+      ctx.fillStyle=getC("--tag");
+      ctx.fillRect(X(p.x)-3,Z(p.z)-3,6,6);}
+    if(i===selected){ctx.strokeStyle=getC("--accent");ctx.lineWidth=2;
+      ctx.strokeRect(X(k.x)-2.5,Z(k.z)-2.5,k.w*scale+5,k.h*scale+5);}
+  }
+
+  // rover start + footprint
+  const s=map.start;
+  ctx.fillStyle="rgba(26,160,90,.16)";ctx.strokeStyle=getC("--start");ctx.lineWidth=1.6;
+  ctx.fillRect(X(s.x-cfg.cw/2),Z(s.z-cfg.cl/2),cfg.cw*scale,cfg.cl*scale);
+  ctx.strokeRect(X(s.x-cfg.cw/2),Z(s.z-cfg.cl/2),cfg.cw*scale,cfg.cl*scale);
+  ctx.beginPath();ctx.arc(X(s.x),Z(s.z),3.5,0,Math.PI*2);ctx.fill();
+
+  if(preview){const cx=map.width/2,cz=map.depth/2;
+    ctx.fillStyle="rgba(255,93,46,.14)";ctx.strokeStyle=getC("--accent");ctx.lineWidth=1.4;
+    ctx.setLineDash([4,3]);
+    ctx.strokeRect(X(cx-cfg.cw/2),Z(cz-cfg.cl/2),cfg.cw*scale,cfg.cl*scale);ctx.setLineDash([]);}
+}
+
+// ---------------------------------------------------------------- interaction
+let drag=null;
+function pt(e){const r=cv.getBoundingClientRect();return {x:e.clientX-r.left,y:e.clientY-r.top};}
+function obsAt(mx,mz){for(let i=map.obstacles.length-1;i>=0;i--){const k=keepRect(map.obstacles[i]);
+  if(mx>=k.x&&mx<=k.x+k.w&&mz>=k.z&&mz<=k.z+k.h)return i;}return -1;}
+cv.addEventListener("pointerdown",e=>{cv.setPointerCapture(e.pointerId);
+  const p=pt(e),mx=iX(p.x),mz=iZ(p.y);
+  if(tool==="start"){map.start.x=Math.round(mx);map.start.z=Math.round(mz);
+    drag={t:"start"};syncInputs();dirty=true;return;}
+  if(tool==="add"){
+    const o={x:Math.round(mx-cfg.osw/2),z:Math.round(mz),tags:[]};
+    const ids=nextFreeIds(4);add2x2(o,0);o.tags.forEach((t,j)=>t.id=ids[j]);
+    map.obstacles.push(o);selected=map.obstacles.length-1;
+    drag={t:"move",i:selected,dx:mx-o.x,dz:mz-o.z};dirty=true;refreshTags();validate();return;}
+  const i=obsAt(mx,mz);selected=i;dirty=true;refreshTags();
+  if(i>=0){const o=map.obstacles[i];drag={t:"move",i,dx:mx-o.x,dz:mz-o.z};}});
+cv.addEventListener("pointermove",e=>{const p=pt(e),mx=iX(p.x),mz=iZ(p.y);
+  const c=document.getElementById("cur");c.style.opacity=1;c.style.left=p.x+"px";c.style.top=p.y+"px";
+  c.textContent=`x ${Math.round(mx)}  z ${Math.round(mz)}`;
+  if(!drag)return;
+  if(drag.t==="start"){map.start.x=Math.round(mx);map.start.z=Math.round(mz);syncInputs();}
+  else{const o=map.obstacles[drag.i];o.x=Math.round(mx-drag.dx);o.z=Math.round(mz-drag.dz);syncInputs();}
+  dirty=true;});
+function endDrag(){if(drag)validate();drag=null;dirty=true;}
+cv.addEventListener("pointerup",endDrag);cv.addEventListener("pointercancel",endDrag);
+cv.addEventListener("pointerleave",()=>document.getElementById("cur").style.opacity=0);
+window.addEventListener("keydown",e=>{
+  if((e.key==="Delete"||e.key==="Backspace")&&selected>=0&&document.activeElement.tagName!=="INPUT"){
+    map.obstacles.splice(selected,1);selected=-1;dirty=true;refreshTags();validate();}});
+document.getElementById("tool").addEventListener("click",e=>{
+  const b=e.target.closest("button[data-tool]");if(!b)return;
+  tool=b.dataset.tool;
+  [...document.querySelectorAll("#tool button")].forEach(x=>x.setAttribute("aria-pressed",x===b));});
+
+// ---------------------------------------------------------------- panel <-> state
+function num(id){return parseFloat(document.getElementById(id).value)||0;}
+function syncInputs(){
+  document.getElementById("mw").value=Math.round(map.width);
+  document.getElementById("md").value=Math.round(map.depth);
+  document.getElementById("sx").value=Math.round(map.start.x);
+  document.getElementById("sz").value=Math.round(map.start.z);
+  document.getElementById("tsz").value=map.tagSize;
+  const F={cw:"cw",cl:"cl",osw:"osw",osh:"osh",padx:"padx",padz:"padz",
+           clr:"clr",maxclr:"maxclr",ctol:"ctol",wclr:"wclr",tp:"tp"};
+  for(const k in F)document.getElementById(F[k]).value=cfg[k];
+  if(selected>=0){const o=map.obstacles[selected];
+    document.getElementById("ox").value=Math.round(o.x);
+    document.getElementById("oz").value=Math.round(o.z);}
+}
+function bindNum(id,set){document.getElementById(id).addEventListener("input",()=>{
+  set(num(id));dirty=true;validate();});}
+bindNum("mw",v=>{map.width=Math.max(500,v);fit();});
+bindNum("md",v=>{map.depth=Math.max(500,v);fit();});
+bindNum("sx",v=>map.start.x=v); bindNum("sz",v=>map.start.z=v);
+bindNum("tsz",v=>map.tagSize=Math.max(10,v));
+["cw","cl","osw","osh","padx","padz","clr","maxclr","ctol","wclr","tp"]
+  .forEach(k=>bindNum(k,v=>cfg[k]=v));
+bindNum("ox",v=>{if(selected>=0)map.obstacles[selected].x=v;});
+bindNum("oz",v=>{if(selected>=0)map.obstacles[selected].z=v;});
+document.getElementById("preview").addEventListener("change",e=>{preview=e.target.checked;dirty=true;});
+document.getElementById("delBtn").onclick=()=>{
+  if(selected<0)return;map.obstacles.splice(selected,1);selected=-1;dirty=true;refreshTags();validate();};
+
+// ---------------------------------------------------------------- tag editor
+function refreshTags(){
+  const box=document.getElementById("selBox"),empty=document.getElementById("selEmpty");
+  if(selected<0){box.style.display="none";empty.style.display="";return;}
+  box.style.display="";empty.style.display="none";
+  const o=map.obstacles[selected],list=document.getElementById("taglist");
+  list.innerHTML="";
+  o.tags.forEach((t,j)=>{
+    const row=document.createElement("div");row.className="tagrow";
+    row.innerHTML=
+      `<input type="number" value="${t.id}" step="1" min="0" data-f="id">`+
+      `<input type="number" value="${t.dx}" step="5" data-f="dx">`+
+      `<input type="number" value="${t.dy}" step="10" data-f="dy">`+
+      `<input type="number" value="${t.dz}" step="5" data-f="dz">`+
+      `<select data-f="facing">`+
+        ["+z","-z","+x","-x"].map(f=>`<option${f===t.facing?" selected":""}>${f}</option>`).join("")+
+      `</select><button class="x" title="remove">×</button>`;
+    row.querySelectorAll("[data-f]").forEach(el=>el.addEventListener("input",()=>{
+      const f=el.dataset.f;t[f]=(f==="facing")?el.value:(parseFloat(el.value)||0);
+      dirty=true;validate();}));
+    row.querySelector(".x").onclick=()=>{o.tags.splice(j,1);refreshTags();dirty=true;validate();};
+    list.appendChild(row);});
+  syncInputs();
+}
+document.getElementById("addTag").onclick=()=>{
+  if(selected<0)return;const o=map.obstacles[selected];
+  o.tags.push({id:nextFreeIds(1)[0],dx:0,dy:1200,dz:Math.round(cfg.osh/2+5),facing:"+z"});
+  refreshTags();dirty=true;validate();};
+document.getElementById("add2x2").onclick=()=>{
+  if(selected<0)return;const o=map.obstacles[selected];
+  const ids=nextFreeIds(4);add2x2(o,0);o.tags.forEach((t,j)=>t.id=ids[j]);
+  refreshTags();dirty=true;validate();};
+
+// ---------------------------------------------------------------- validation
+function validate(){
+  const out=[],add=(m,bad)=>out.push({m,bad:!!bad});
+  const hw=cfg.cw/2,hl=cfg.cl/2;
+
+  // duplicate tag ids — build_tag_table raises outright on these
+  const seen=new Map();
+  map.obstacles.forEach((o,i)=>o.tags.forEach(t=>{
+    const k=+t.id;if(seen.has(k))add(`Tag id ${k} is used on panels ${seen.get(k)} and ${i}`,true);
+    else seen.set(k,i);}));
+
+  map.obstacles.forEach((o,i)=>{
+    const k=keepRect(o);
+    if(k.x<0||k.z<0||k.x+k.w>map.width||k.z+k.h>map.depth)
+      add(`Panel ${i} keep-out extends outside the arena`,true);
+    o.tags.forEach(t=>{
+      // a tag must physically fit on the face it is stuck to
+      const half=map.tagSize/2;
+      if(Math.abs(+t.dx)+half>cfg.osw/2)
+        add(`Panel ${i} tag ${t.id}: |dx| ${Math.abs(+t.dx)} + ${half} overhangs the ${cfg.osw} mm face`);
+      if((+t.dy)-half<0) add(`Panel ${i} tag ${t.id}: dy ${t.dy} puts the tag through the floor`);
+      // facing must be explicit when dz does not sit at a half-extent, or the
+      // loader's inference can pick the wrong face
+      const near=Math.abs(Math.abs(+t.dz)-(cfg.osh/2+cfg.padz))<40||Math.abs(Math.abs(+t.dz)-cfg.osh/2)<40;
+      if(!near&&!t.facing) add(`Panel ${i} tag ${t.id}: dz ${t.dz} is not near a face — set facing explicitly`);
+    });
+    for(let j=i+1;j<map.obstacles.length;j++){const b=keepRect(map.obstacles[j]);
+      if(k.x<b.x+b.w&&b.x<k.x+k.w&&k.z<b.z+b.h&&b.z<k.z+k.h)
+        add(`Panels ${i} and ${j} overlap`,true);}
+  });
+
+  // rover start must be legal or the planner refuses every route from it
+  const s=map.start;
+  if(s.x-hw<0||s.z-hl<0||s.x+hw>map.width||s.z+hl>map.depth)
+    add(`Rover start footprint sticks out of the arena by ${Math.round(Math.max(hw-s.x,hl-s.z,s.x+hw-map.width,s.z+hl-map.depth))} mm`);
+  map.obstacles.forEach((o,i)=>{const k=keepRect(o);
+    if(s.x+hw>k.x-cfg.clr&&s.x-hw<k.x+k.w+cfg.clr&&s.z+hl>k.z-cfg.clr&&s.z-hl<k.z+k.h+cfg.clr)
+      add(`Rover start is inside panel ${i}'s clearance zone`,true);});
+
+  if(cfg.maxclr<cfg.clr) add("max_clearance is below clearance — the widening search is disabled");
+  if(cfg.osh+2*cfg.padz<=0) add("Panel thickness + foot pad is zero",true);
+
+  const box=document.getElementById("issues");box.innerHTML="";
+  if(!out.length){const d=document.createElement("div");d.className="issue ok";
+    d.textContent=I18N.ok[lang];box.appendChild(d);return;}
+  out.forEach(o=>{const d=document.createElement("div");
+    d.className="issue"+(o.bad?" bad":"");d.textContent=o.m;box.appendChild(d);});
+}
+
+// ---------------------------------------------------------------- import
+function readJSON(input,cb){input.addEventListener("change",()=>{
+  const f=input.files&&input.files[0];if(!f)return;
+  const r=new FileReader();
+  r.onload=()=>{try{cb(JSON.parse(r.result));}catch(err){alert("Could not parse JSON: "+err.message);}
+    input.value="";};
+  r.readAsText(f);});}
+document.getElementById("impMapBtn").onclick=()=>document.getElementById("impMap").click();
+document.getElementById("impCfgBtn").onclick=()=>document.getElementById("impCfg").click();
+
+readJSON(document.getElementById("impMap"),j=>{
+  if(j.size){map.width=+j.size.width||map.width;map.depth=+j.size.depth||map.depth;}
+  if(j.rover_start){map.start={x:+j.rover_start.x||0,z:+j.rover_start.z||0};}
+  if(j.tag_size_mm)map.tagSize=+j.tag_size_mm;
+  const obs=j.obstacles||[];
+  // Legacy min-corner files carry w/h per obstacle; the current schema does
+  // not. Convert as we read: z_mid = z_min + h/2, and adopt the size globally.
+  const legacy=obs.length&&("w" in obs[0]);
+  if(legacy){cfg.osw=+obs[0].w||cfg.osw;
+    // a legacy box already described the full footprint (wall + feet), so treat
+    // it as the keep-out and keep the wall thin unless the user says otherwise
+    const full=+obs[0].h||cfg.osh;
+    if(full>cfg.osh)cfg.padz=Math.max(0,(full-cfg.osh)/2);}
+  map.obstacles=obs.map(o=>{
+    const zMid=legacy?(+o.z+(+o.h||0)/2):+o.z;
+    return {x:+o.x,z:zMid,
+            tags:(o.tags||[]).map(t=>({id:+t.id,dx:+t.dx||0,dy:+t.dy||0,dz:+t.dz||0,
+                                       facing:t.facing||"+z"}))};});
+  selected=-1;fit();syncInputs();refreshTags();validate();dirty=true;});
+
+readJSON(document.getElementById("impCfg"),j=>{
+  if(j.car){cfg.cw=+j.car.width||cfg.cw;cfg.cl=+j.car.length||cfg.cl;}
+  if(j.obstacle_size){cfg.osw=+j.obstacle_size.w||cfg.osw;cfg.osh=+j.obstacle_size.h||cfg.osh;}
+  if(j.obstacle_pad){cfg.padx=+j.obstacle_pad.x||0;cfg.padz=+j.obstacle_pad.z||0;}
+  if(j.clearance!=null)cfg.clr=+j.clearance;
+  if(j.max_clearance!=null)cfg.maxclr=+j.max_clearance;
+  if(j.clearance_tolerance!=null)cfg.ctol=+j.clearance_tolerance;
+  if(j.wall_clearance!=null)cfg.wclr=+j.wall_clearance;
+  if(j.turn_penalty!=null)cfg.tp=+j.turn_penalty;
+  syncInputs();validate();dirty=true;});
+
+// ---------------------------------------------------------------- export
+function download(name,obj){
+  const blob=new Blob([JSON.stringify(obj,null,2)+"\n"],{type:"application/json"});
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;a.click();
+  URL.revokeObjectURL(a.href);}
+
+document.getElementById("expMap").onclick=()=>download("map.json",{
+  format:"pathlab-map",version:1,units:"mm",
+  size:{width:Math.round(map.width),depth:Math.round(map.depth)},
+  // obstacles carry NO w/h: the size lives once in config.json, and (x, z) is
+  // the -x edge on the z midline.
+  obstacles:map.obstacles.map(o=>({
+    x:Math.round(o.x),z:Math.round(o.z),
+    tags:o.tags.map(t=>({id:Math.round(+t.id),dx:Math.round(+t.dx),
+                         dy:Math.round(+t.dy),dz:Math.round(+t.dz),
+                         facing:t.facing||"+z"}))})),
+  rover_start:{x:Math.round(map.start.x),z:Math.round(map.start.z)},
+  tag_size_mm:Math.round(map.tagSize)});
+
+document.getElementById("expCfg").onclick=()=>download("config.json",{
+  format:"pathlab-config",version:1,units:"mm",
+  car:{width:Math.round(cfg.cw),length:Math.round(cfg.cl)},
+  obstacle_size:{w:Math.round(cfg.osw),h:Math.round(cfg.osh)},
+  obstacle_pad:{x:Math.round(cfg.padx),z:Math.round(cfg.padz)},
+  clearance:Math.round(cfg.clr),
+  max_clearance:Math.round(cfg.maxclr),
+  clearance_tolerance:Math.round(cfg.ctol),
+  wall_clearance:Math.round(cfg.wclr),
+  turn_penalty:Math.round(cfg.tp)});
+
+// ---------------------------------------------------------------- boot
+function loop(){if(dirty){dirty=false;}draw();requestAnimationFrame(loop);}
+window.addEventListener("resize",resize);
+resize();applyLang();refreshTags();validate();requestAnimationFrame(loop);
+</script>
+</html>
