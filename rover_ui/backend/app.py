@@ -24,8 +24,12 @@ Endpoints:
   POST /api/nav/cancel         -> cancel the active navigation (stops the rover)
   POST /api/nav/auto           -> {enabled} toggle auto-navigate on detections
   POST /api/nav/follow         -> {enabled} toggle live-follow (re-plan on target move)
+  POST /api/nav/ignore_obstacles -> {enabled} ignore the rover's own position when it
+                                    overlaps an obstacle/clearance zone (start/continue)
   POST /api/nav/speed          -> {mps} set the navigation speed cap (clamped)
   POST /api/nav/jog_speed      -> {mps} set the Drive-pad hold-to-move speed
+  POST /api/nav/confirm_n      -> {n} set the ghost-guard confirm-count (1-10, clamped)
+  POST /api/nav/standoff       -> {mm} set the target approach distance (clamped)
   POST /api/nav/reset_pose     -> {x?, z?} anchor the current pose to a map cell
   POST /api/nav/nudge          -> {axis, mm} small open-map setup move
 """
@@ -220,6 +224,10 @@ class FollowBody(BaseModel):
     enabled: bool
 
 
+class IgnoreObstaclesBody(BaseModel):
+    enabled: bool
+
+
 class SpeedBody(BaseModel):
     mps: float
 
@@ -228,9 +236,22 @@ class JogSpeedBody(BaseModel):
     mps: float
 
 
+class StandoffBody(BaseModel):
+    mm: float
+
+
+class ConfirmNBody(BaseModel):
+    n: int
+
+
 class ResetPoseBody(BaseModel):
     x: Optional[float] = None
     z: Optional[float] = None
+
+
+class SetStartBody(BaseModel):
+    x: float
+    z: float
 
 
 class NudgeBody(BaseModel):
@@ -285,6 +306,16 @@ def nav_follow(body: FollowBody):
     return {"ok": True, "follow": body.enabled, "nav": nav.state()}
 
 
+@app.post("/api/nav/ignore_obstacles")
+def nav_ignore_obstacles(body: IgnoreObstaclesBody):
+    """Toggle the operator override: when enabled, the rover's OWN current
+    position being inside an obstacle/clearance zone no longer blocks starting
+    a plan or continuing a move (obstacle avoidance everywhere else is
+    unaffected). Takes effect immediately, including mid-move."""
+    applied = nav.set_ignore_obstacles(body.enabled)
+    return {"ok": True, "ignore_obstacles": applied, "nav": nav.state()}
+
+
 @app.post("/api/nav/speed")
 def nav_speed(body: SpeedBody):
     """Set the navigation speed cap (m/s), clamped to NAV_SPEED_MIN/MAX.
@@ -301,10 +332,43 @@ def nav_jog_speed(body: JogSpeedBody):
     return {"ok": True, "jog_speed": applied}
 
 
+@app.post("/api/nav/confirm_n")
+def nav_confirm_n(body: ConfirmNBody):
+    """Set how many mutually-consistent detector frames (1-10, clamped) must
+    accumulate before a new/relocated detection target is trusted (the
+    ghost-detection guard in Navigator.project_detection). Takes effect on
+    the very next detection, no restart needed."""
+    applied = nav.set_confirm_n(body.n)
+    return {"ok": True, "confirm_n": applied, "nav": nav.state()}
+
+
+@app.post("/api/nav/standoff")
+def nav_standoff(body: StandoffBody):
+    """Set how far short of the target the rover stops (mm), clamped to
+    [NAV_STANDOFF_MIN_MM, NAV_STANDOFF_MAX_MM].
+
+    This is the SOFT preference used by Navigator.compute_goal — obstacle
+    avoidance still wins, so the achieved distance can differ when the
+    preferred spot is blocked. Applies to the next goal computation, which in
+    AUTO/FOLLOW is the very next cycle."""
+    applied = nav.set_standoff(body.mm)
+    return {"ok": True, "standoff_mm": applied, "nav": nav.state()}
+
+
 @app.post("/api/nav/reload_map")
 def nav_reload_map():
     """Hot-reload an edited map.json / config.json (refused mid-navigation)."""
     ok, msg = nav.reload_files()
+    code = 200 if ok else 409
+    return JSONResponse({"ok": ok, "message": msg, "map": nav.map_payload() if ok else None},
+                        status_code=code)
+
+
+@app.post("/api/nav/set_start")
+def nav_set_start(body: SetStartBody):
+    """Change the configured start cell (map.json rover_start) and persist it.
+    Returns the refreshed map payload so the UI can redraw the start marker."""
+    ok, msg = nav.set_start_cell(body.x, body.z)
     code = 200 if ok else 409
     return JSONResponse({"ok": ok, "message": msg, "map": nav.map_payload() if ok else None},
                         status_code=code)
