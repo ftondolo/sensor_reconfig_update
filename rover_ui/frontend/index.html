@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Rover Operator — Map Navigation</title>
-  <link rel="stylesheet" href="/static/audience.css?v=demo7" />
+  <link rel="stylesheet" href="/static/audience.css?v=demo10" />
 </head>
 <body>
   <header class="topbar">
@@ -31,6 +31,10 @@
           <span>goal <b id="goal-xy">—</b></span>
           <span>leg <b id="nav-leg">—</b></span>
           <span>pose <b id="pose-src">—</b></span>
+          <span>clearance <b id="nav-clearance">—</b></span>
+          <span>drift <b id="nav-drift">—</b></span>
+          <span>tags <b id="nav-tags">—</b></span>
+          <span>accumulation <b id="nav-accum">—</b></span>
           <span>msg <b id="nav-msg-strip">—</b></span>
         </div>
       </div>
@@ -58,10 +62,23 @@
         <div class="btn-row">
           <button id="btn-home" class="btn">🏠 Return to start</button>
         </div>
+        <div class="btn-row">
+          <button id="btn-ignore-obstacles" class="btn">Ignore obstacles: off</button>
+        </div>
         <div class="speed-row">
           <label for="speed-input">Speed <b id="speed-val">—</b> m/s</label>
           <input type="range" id="speed-input" min="0.05" max="0.80" step="0.01" disabled />
           <span class="dim" id="speed-range">—</span>
+        </div>
+        <div class="speed-row">
+          <label for="standoff-input">Approach <b id="standoff-val">—</b> mm</label>
+          <input type="number" id="standoff-input" min="1000" max="4000" step="50" disabled />
+          <span class="dim" id="standoff-range">—</span>
+        </div>
+        <div class="speed-row">
+          <label for="confirm-n-input">Confirm-N <b id="confirm-n-val">—</b></label>
+          <input type="number" id="confirm-n-input" min="1" max="10" step="1"
+                 style="width:56px" disabled />
         </div>
         <p class="hint">
           <b>Navigate to detection</b> projects the live fused target (camera
@@ -70,6 +87,9 @@
           <b>Follow</b> tracks the live target continuously and re-plans the
           moment it moves, overriding the navigation in progress.
           <b>Speed</b> caps the drive speed (applies live, even mid-move).
+          <b>Confirm-N</b> is how many consistent detections in a row are
+          needed before a new/moved target is trusted (higher = steadier but
+          slower to react; 1-10).
           Clicking the map navigates to a manual target instead.
         </p>
       </div>
@@ -86,6 +106,20 @@
           Place the rover physically on its start cell
           (<span id="start-cell">—</span>, facing the top of the map), then
           re-anchor so map position matches reality.
+        </p>
+        <h3>Start position</h3>
+        <div class="btn-row start-pos-row">
+          <label for="start-x">x</label>
+          <input type="number" id="start-x" step="0.1" min="0" />
+          <label for="start-z">z</label>
+          <input type="number" id="start-z" step="0.1" min="0" />
+          <span class="dim">m</span>
+          <button id="btn-set-start" class="btn">Set start position</button>
+        </div>
+        <p class="hint">
+          Enter the start cell (rover_start) in metres and save it back to
+          map.json. Changes the home / re-anchor target only — it does not move
+          the rover.
         </p>
       </div>
 
@@ -117,7 +151,7 @@
     </aside>
   </main>
 
-  <script src="/static/map_view.js?v=demo6"></script>
-  <script src="/static/app.js?v=demo9"></script>
+  <script src="/static/map_view.js?v=demo8"></script>
+  <script src="/static/app.js?v=demo18"></script>
 </body>
 </html>
