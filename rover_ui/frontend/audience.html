@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Rover Map Navigation — Live</title>
-  <link rel="stylesheet" href="/static/audience.css?v=demo10" />
+  <link rel="stylesheet" href="/static/audience.css?v=demo13" />
 </head>
 <body>
   <header class="topbar">
@@ -31,6 +31,7 @@
           <span>goal <b id="goal-xy">—</b></span>
           <span>leg <b id="nav-leg">—</b></span>
           <span>pose <b id="pose-src">—</b></span>
+          <span>accumulation <b id="nav-accum">—</b></span>
         </div>
       </div>
       <div class="legend">
@@ -44,11 +45,11 @@
 
     <!-- ============ sensor grid ============ -->
     <section class="grid">
-      <div class="cam-card">
+      <div class="cam-card" id="card-rgb">
         <div class="cam-head"><span>RGB + Detection</span><span id="st-detector" class="badge">—</span></div>
         <div class="cam-body"><img id="detect-img" class="cam-img" alt="rgb + detections" /></div>
       </div>
-      <div class="cam-card">
+      <div class="cam-card" id="card-thermal">
         <div class="cam-head"><span>Thermal (FLIR)</span><span id="st-flir_thermal" class="badge">—</span></div>
         <div class="cam-body"><img id="thermal-img" class="cam-img" alt="thermal" /></div>
       </div>
@@ -56,7 +57,7 @@
         <div class="cam-head"><span>Depth (D435i)</span><span id="st-d435i_rgb" class="badge">—</span></div>
         <div class="cam-body"><img id="depth-img" class="cam-img" alt="depth" /></div>
       </div>
-      <div class="cam-card">
+      <div class="cam-card" id="card-radar">
         <div class="cam-head"><span>mmWave Radar</span><span id="st-mmwave_radar" class="badge">—</span></div>
         <div class="cam-body"><canvas id="mmwave-canvas" class="cam-canvas" width="520" height="400"></canvas></div>
       </div>
@@ -141,7 +142,7 @@
     </aside>
   </main>
 
-  <script src="/static/map_view.js?v=demo10"></script>
-  <script src="/static/audience.js?v=demo12"></script>
+  <script src="/static/map_view.js?v=demo12"></script>
+  <script src="/static/audience.js?v=demo14"></script>
 </body>
 </html>
