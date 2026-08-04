@@ -24,12 +24,19 @@ import math
 import os
 import sys
 import threading
+import json
 import time
 
 import numpy as np
 
 from ..sensors.base import SensorThread, LatestValue
 from .. import config
+
+# Repo root holds rectilinear_mm.py, which owns the obstacle-schema normaliser.
+# Tags must resolve panel geometry exactly the way the planner does, so both
+# read it from the same place rather than each parsing map.json their own way.
+if config.DEMO_ROOT not in sys.path:
+    sys.path.insert(0, config.DEMO_ROOT)
 
 try:
     import cv2
@@ -73,6 +80,16 @@ class DetectorThread(SensorThread):
     def __init__(self, rgb_sensor, thermal_sensor, radar_sensor=None, allow_mock: bool = True):
         super().__init__(allow_mock)
         self._rgb_sensor = rgb_sensor
+        # ArUco tag localiser: an ABSOLUTE map fix from markers on the panels.
+        # Built lazily on first use so a map reload picks up new tags, and
+        # self-disabling when cv2.aruco, intrinsics or tag definitions are
+        # missing. Published in telemetry; the navigator decides whether to act.
+        self._tagloc = None
+        self._tag_fix = None
+        self._tag_t = 0.0
+        self._tag_idle = None      # why no fix is being produced, for the UI
+        self._tag_audit_t = 0.0    # last time the (expensive) audit was run
+        self._tag_audit_last = None  # keep the last verdict between audits
         self._thermal_sensor = thermal_sensor
         self._radar_sensor = radar_sensor
         self.telemetry = LatestValue()
@@ -125,6 +142,9 @@ class DetectorThread(SensorThread):
         self._sm = None               # {cx, cy, bw, bh, range, score, contrib, radar, t}
         self._last_depth = None       # (range_m, t) last good D435 depth, for the
                                       # depth->mmwave hold (see _assemble_dets)
+        self._last_vis = None         # (cam_az_deg, t) of the last ACCEPTED vision
+                                      # detection — the vision-authority gate on
+                                      # radar range fusion / takeover (_assemble_dets)
         self._disp_dets = []          # smoothed det(s) the render loop draws
         self._disp_target = None      # smoothed {x, az, range, source} for control
         # Debounced displayed resolution (shows the DQN's adaptive res, no flicker).
@@ -255,6 +275,8 @@ class DetectorThread(SensorThread):
             tc.accum_sec = float(config.RADAR_ACCUM_SEC)
             tc.v_move = float(config.RADAR_V_MOVE)
             tc.gate_radius = float(config.RADAR_GATE_RADIUS)
+            tc.acquire_confirm_s = float(config.RADAR_ACQUIRE_CONFIRM_S)
+            tc.acquire_confirm_radius = float(config.RADAR_ACQUIRE_CONFIRM_RADIUS)
             tc.hold_timeout = float(config.RADAR_HOLD_TIMEOUT)
             tc.confirm_hold = float(config.RADAR_CONFIRM_HOLD)
             tc.pos_smooth = float(config.RADAR_POS_SMOOTH)
@@ -457,10 +479,14 @@ class DetectorThread(SensorThread):
                                "az": round(float(rinfo["az"]), 1)}
                               if rinfo and rinfo.get("range") is not None
                               and rinfo.get("az") is not None else None)
+        tel["tag_fix"] = self._tag_fix
         tel["dbg"] = {"vbox": int(len(boxes)),
                       "vmax": round(float(scores.max()), 2) if len(scores) else 0.0,
                       "tracks": int(len(pb)),
                       "radar": rinfo is not None}
+        self._tag_step(rgb)
+        tel["tag_fix"] = self._tag_fix
+        tel["tag_idle"] = self._tag_idle
         self.telemetry.set(tel)
 
         self._frame_i += 1
@@ -654,10 +680,14 @@ class DetectorThread(SensorThread):
 
     def _target_bearing(self, dets, rinfo, w, h):
         """Unified target for the bearing line + rover control. Aligns to the
-        vision detection when there is one (radar supplies range); otherwise
-        falls back to the radar azimuth — the rover-control mode used when RGB
-        and thermal both fail. Returns {x, az(deg), range, source} or None."""
+        vision detection when there is one (radar supplies range only when its
+        bearing agrees); falls back to the radar azimuth only when RGB and
+        thermal both fail. Returns {x, az(deg), range, source} or None.
+
+        NOTE: currently uncalled (the render loop draws the smoothed control
+        target); kept aligned with _assemble_dets' vision-first policy."""
         hfov = float(config.DETECT_RGB_HFOV)
+        tol = float(config.FOLLOW_FUSE_TOL)
         vis = [d for d in dets if not d.get("radar")]
         radar_rng = rinfo.get("range") if rinfo else None
         # Radar bearing in the CAMERA frame (+ = right), so it's directly
@@ -672,22 +702,24 @@ class DetectorThread(SensorThread):
 
         def vis_target(d):
             cx = (d["box"][0] + d["box"][2]) / 2.0
+            rng = (radar_rng if (radar_az is not None
+                                 and abs(vis_az(d) - radar_az) <= tol) else None)
             return {"x": float(cx), "az": round(vis_az(d), 1),
-                    "range": radar_rng, "source": "vision"}
+                    "range": rng, "source": "vision"}
 
         if vis:
+            # VISION FIRST (matches _assemble_dets): the radar refines the
+            # choice AMONG vision boxes — prefer the one matching its bearing —
+            # but a radar lock that agrees with NO box is measuring some other
+            # return (e.g. a multipath ghost) and never steals the line.
+            best = None
             if radar_az is not None:
-                # Radar = the anchor (the one real moving human). Only accept a
-                # vision box whose bearing AGREES with the radar; reject the rest
-                # (wrong RGB/thermal detections can't steer the rover).
-                tol = float(config.FOLLOW_FUSE_TOL)
                 ok = [d for d in vis if abs(vis_az(d) - radar_az) <= tol]
                 if ok:
-                    return vis_target(min(ok, key=lambda d: abs(vis_az(d) - radar_az)))
-                # no vision box matches the radar -> fall through to the radar target
-            else:
-                # No radar lock to cross-check -> trust the largest vision box.
-                return vis_target(max(vis, key=lambda b: (b["box"][2] - b["box"][0]) * (b["box"][3] - b["box"][1])))
+                    best = min(ok, key=lambda d: abs(vis_az(d) - radar_az))
+            if best is None:
+                best = max(vis, key=lambda b: (b["box"][2] - b["box"][0]) * (b["box"][3] - b["box"][1]))
+            return vis_target(best)
         if radar_az is not None:
             frac = max(-1.0, min(1.0, radar_az / (hfov / 2.0)))
             return {"x": float(w * 0.5 * (1 + frac)), "az": round(radar_az, 1),
@@ -826,16 +858,30 @@ class DetectorThread(SensorThread):
     def _assemble_dets(self, pb, ps, pc, w, h, rinfo):
         """Return the ONE correct detection (a 0- or 1-element list).
 
-        Policy — VISION FIRST, mmWave only as a fallback:
+        Policy — VISION FIRST, mmWave only as a bearing-consistent fallback:
           * any vision (RGB/thermal) box -> trust the most-confident one if it
             clears DETECT_CONF_NORADAR. The radar never selects or rejects
             vision boxes; its measured range is still fused in (vision has no
-            range), but that is distance fusion, not detection.
-          * NO vision box -> radar-only detection. rinfo is only ever non-None
-            here while the rover itself is stationary AND a moving cluster was
-            acquired (see the ingestion gate in read_once), so a radar-driven
-            target can never come from the rover's own ego-motion.
+            range) — but ONLY when the radar bearing agrees with that box
+            (FOLLOW_FUSE_TOL): a disagreeing radar lock is measuring some OTHER
+            return (e.g. a transient multipath ghost) and must not corrupt the
+            target's range.
+          * NO vision box -> a radar-only detection may SUSTAIN the target
+            through a brief dropout at a bearing consistent with where vision
+            last saw it, but may REDEFINE it (a new bearing) only once vision
+            has been absent for DETECT_RADAR_TAKEOVER_S. rinfo is only ever
+            non-None here while the rover itself is stationary AND a moving
+            cluster was confirmed (radar_tracker acquire confirmation + the
+            ingestion gate in read_once), so a radar-driven target can never
+            come from the rover's own ego-motion.
         """
+        hfov = float(config.DETECT_RGB_HFOV)
+        tol = float(config.FOLLOW_FUSE_TOL)
+        now = time.time()
+        # Radar bearing in the CAMERA frame (+ = right), comparable to boxes.
+        radar_az = None
+        if rinfo is not None and rinfo.get("az") is not None:
+            radar_az = (-rinfo["az"] if config.DETECT_RADAR_FLIP else rinfo["az"])
         n = len(pb)
         chosen = None
         if n > 0:
@@ -847,23 +893,29 @@ class DetectorThread(SensorThread):
             dets = self._build_dets(pb[chosen:chosen + 1], ps[chosen:chosen + 1], pc[chosen:chosen + 1])
             # Distance for a vision detection: D435 depth is the baseline (same
             # view as RGB, aligned per-pixel). When depth drops out we fall back
-            # to the radar (mmWave) range — BUT if that radar range is wildly
-            # different from the last depth (a spurious jump on the handoff), we
-            # keep using the last depth value for a short hold instead of
-            # teleporting the distance. Radar is accepted once it's close again,
-            # or after DETECT_DEPTH_HOLD_S, or if there was no recent depth.
+            # to the radar (mmWave) range — IF the radar bearing agrees with the
+            # box, i.e. it is measuring the same object — BUT if that radar
+            # range is wildly different from the last depth (a spurious jump on
+            # the handoff), we keep using the last depth value for a short hold
+            # instead of teleporting the distance. The hold also covers a gated
+            # or absent radar. Radar is accepted once it's close again, or after
+            # DETECT_DEPTH_HOLD_S, or if there was no recent depth.
             for d in dets:
+                x1b, _, x2b, _ = d["box"]
+                vis_az = ((x1b + x2b) / 2.0 / w - 0.5) * hfov
+                self._last_vis = (vis_az, now)   # vision authority (radar gates)
+                radar_rng = None
+                if radar_az is not None and abs(vis_az - radar_az) <= tol:
+                    radar_rng = rinfo.get("range")
                 dr = self._depth_range(d["box"], w, h)
-                now = time.time()
-                radar_rng = rinfo.get("range") if rinfo is not None else None
                 if dr is not None:
                     d["range"] = round(dr, 3)
                     d["range_src"] = "depth"
                     self._last_depth = (dr, now)
                 elif (self._last_depth is not None
                       and now - self._last_depth[1] <= float(config.DETECT_DEPTH_HOLD_S)
-                      and radar_rng is not None
-                      and abs(radar_rng - self._last_depth[0]) > float(config.DETECT_DEPTH_HOLD_JUMP_M)):
+                      and (radar_rng is None
+                           or abs(radar_rng - self._last_depth[0]) > float(config.DETECT_DEPTH_HOLD_JUMP_M))):
                     d["range"] = round(self._last_depth[0], 3)
                     d["range_src"] = "depth_hold"
                 elif radar_rng is not None:
@@ -873,8 +925,18 @@ class DetectorThread(SensorThread):
                     d["range"] = None
                     d["range_src"] = None
             return dets
-        if rinfo is not None and rinfo.get("az") is not None:
-            return [self._radar_det(w, h, rinfo)]
+        if radar_az is not None:
+            # Radar-only fallback under vision authority: while the last vision
+            # detection is fresher than DETECT_RADAR_TAKEOVER_S, accept the
+            # radar det only at a FOLLOW_FUSE_TOL-consistent bearing — sustain
+            # the SAME object through a brief dropout, never relocate the
+            # target. Once vision has been gone longer than the window (true
+            # occlusion / out of FoV), the radar may lead from any bearing.
+            lv = self._last_vis
+            if (lv is None
+                    or now - lv[1] > float(config.DETECT_RADAR_TAKEOVER_S)
+                    or abs(radar_az - lv[0]) <= tol):
+                return [self._radar_det(w, h, rinfo)]
         return []
 
     def _depth_range(self, box, w, h):
@@ -966,6 +1028,135 @@ class DetectorThread(SensorThread):
                 "range": self._sm["range"] if self._sm else None,
                 "range_src": self._sm.get("range_src") if self._sm else None,
                 "source": "radar" if sdet.get("radar") else "vision"}
+
+    def _tag_step(self, rgb):
+        """Solve an absolute map fix from any ArUco tags in view, at
+        TAGS_DETECT_HZ. Cheap (a few ms at 640x480) and entirely optional: any
+        missing piece — cv2.aruco, camera intrinsics, tags in map.json —
+        leaves self._tag_fix as None and the rest of the system unchanged."""
+        if not config.TAGS_ENABLED or rgb is None:
+            self._tag_idle = ("disabled in config" if not config.TAGS_ENABLED
+                              else "no camera frame")
+            return
+        now = time.time()
+        if now - self._tag_t < 1.0 / max(float(config.TAGS_DETECT_HZ), 0.1):
+            return
+        self._tag_t = now
+        if self._tagloc is None:
+            try:
+                from .tag_localizer import TagLocalizer, build_tag_table
+                from rectilinear_mm import obstacle_boxes
+                with open(config.MAP_FILE, "r") as f:
+                    mp = json.load(f)
+                try:
+                    with open(config.PLAN_CONFIG_FILE, "r") as f:
+                        pc = json.load(f)
+                except Exception:
+                    pc = {}
+                # PANEL boxes (the bare wall), not the collision boxes: a tag is
+                # stuck to the panel surface, not to the stabiliser feet.
+                table = build_tag_table(mp, float(config.TAGS_SIZE_MM),
+                                        panel_boxes=obstacle_boxes(mp, pc, "panel"))
+                self._tagloc = TagLocalizer(
+                    table, str(config.TAGS_DICT),
+                    min_spread_mm=float(config.TAGS_MIN_SPREAD_MM),
+                    corner_refine=str(config.TAGS_CORNER_REFINE),
+                    win_min=int(config.TAGS_THRESH_WIN_MIN),
+                    win_max=int(config.TAGS_THRESH_WIN_MAX),
+                    win_step=int(config.TAGS_THRESH_WIN_STEP),
+                    unsharp_amount=float(config.TAGS_UNSHARP_AMOUNT),
+                    unsharp_sigma=float(config.TAGS_UNSHARP_SIGMA))
+                if not self._tagloc.enabled:
+                    print("[detector] tag localiser idle (no tags in map.json "
+                          "or cv2.aruco unavailable)")
+            except Exception as e:
+                print("[detector] tag localiser disabled: %s" % e)
+                self._tagloc = False
+        if not self._tagloc:
+            self._tag_idle = "localiser unavailable (cv2.aruco or map tags missing)"
+            return
+        K = getattr(self._rgb_sensor, "color_K", None)
+        if K is None:
+            # Silent failure here was why the UI could show "tags —" forever
+            # with no detections AND no rejections: no intrinsics, no solve,
+            # no counter, no clue. Say it once.
+            if not getattr(self, "_tag_warned_K", False):
+                self._tag_warned_K = True
+                print("[detector] tag localisation idle: no colour intrinsics "
+                      "from the D435 (camera in mock mode, or open() failed)")
+            self._tag_idle = "no camera intrinsics"
+            return
+        try:
+            fix = self._tagloc.solve(rgb, K, getattr(self._rgb_sensor, "color_dist", None))
+        except Exception as e:
+            print("[detector] tag solve failed: %s" % e)
+            return
+        # Report the SPECIFIC reason the solve failed, not a blanket "no tags":
+        # "one vertical column" and "nothing detected" need opposite responses.
+        self._tag_idle = (None if fix is not None
+                          else (getattr(self._tagloc, "last_reason", None)
+                                or "no known tags in view"))
+        if fix is not None:
+            fix["t"] = now
+            # When the solve disagrees with the map, work out WHY. A wrong tag
+            # SIZE is a uniform scale error that a single ratio absorbs; a
+            # misplaced or mis-identified tag is local and does not rescale
+            # away. This runs only on bad frames, so it costs nothing normally.
+            # Rate-limited: the audit only tells the operator WHY the map and
+            # the camera disagree, which does not change frame to frame. Running
+            # it on every bad frame (and every real frame here is a bad frame)
+            # burned more CPU than the detection itself.
+            due = (now - getattr(self, "_tag_audit_t", 0.0)
+                   >= float(config.TAGS_AUDIT_MIN_INTERVAL_S))
+            if due and float(fix.get("rms_px", 0.0)) > float(config.TAGS_AUDIT_RMS_PX):
+                self._tag_audit_t = now
+                try:
+                    a = self._tagloc.audit(self._tagloc._last_obj,
+                                           self._tagloc._last_img, K,
+                                           getattr(self._rgb_sensor, "color_dist", None))
+                    if a:
+                        fix["audit"] = a
+                        dis = a.get("panel_disagree_mm")
+                        if dis is not None and dis > 150:
+                            pair = a.get("panel_pair") or []
+                            a["verdict"] = (
+                                "panels %s disagree by %d mm about where the camera "
+                                "is — one of them has MOVED from its mapped x/z"
+                                % ("/".join(str(p_) for p_ in pair), dis))
+                        elif a["scale_rms"] < 0.25 * a["base_rms"] and abs(a["scale"] - 1.0) > 0.05:
+                            a["verdict"] = (
+                                "tag SIZE looks wrong: best fit is %.2fx, i.e. ~%.0f mm "
+                                "not the declared %.0f mm"
+                                % (a["scale"], float(config.TAGS_SIZE_MM) * a["scale"],
+                                   float(config.TAGS_SIZE_MM)))
+                        else:
+                            worst = max(a["per_tag"], key=lambda k: a["per_tag"][k]) \
+                                if a["per_tag"] else None
+                            npan = int(a.get("n_panels", 1) or 1)
+                            if worst is None:
+                                a["verdict"] = "solve disagrees with the map"
+                            elif npan > 1:
+                                a["verdict"] = (
+                                    "tag %s has the largest residual (%.1f px) — but "
+                                    "tags from %d panels are in view, so this names "
+                                    "the MINORITY group; check its panel's x/z too"
+                                    % (worst, a["per_tag"][worst], npan))
+                            else:
+                                # Single panel in view: it can only disagree with
+                                # ITSELF, so the fault is that panel's own tag
+                                # offsets, not where the panel sits.
+                                a["verdict"] = (
+                                    "all tags are on ONE panel yet disagree by "
+                                    "%.1f px (worst: tag %s) — that panel's own "
+                                    "dx/dy offsets are wrong, not its x/z"
+                                    % (a["base_rms"], worst))
+                        fix["audit"] = a
+                    self._tag_audit_last = fix.get("audit")
+                except Exception as e:
+                    print("[detector] tag audit failed: %s" % e)
+            elif self._tag_audit_last is not None:
+                fix["audit"] = self._tag_audit_last   # last known diagnosis
+        self._tag_fix = fix
 
     def _telemetry(self, dets, settings, w, h, mock):
         if dets:
