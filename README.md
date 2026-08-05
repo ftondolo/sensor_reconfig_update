@@ -318,6 +318,9 @@ reads and writes `map.json` and `config.json` in the current schema, imports the
 legacy one, edits tags per panel, and validates duplicate IDs, tags overhanging
 a panel face, overlapping panels, and an illegal start cell.
 
+---
+
+## 11.Rover Platform Boot Sequence 
 
 1. Ensure center emergency stop button is depressed and rightmost is instead engaged - then press leftmost metal latching switch to turn on power, a green ring should illuminate 
 2. Press & hold Power button on battery pack until screen illuminates then press “Switch” button once to turn on AC power distribution- the power draw should quickly get up to approx. 26W
