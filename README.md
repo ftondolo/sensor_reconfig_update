@@ -317,3 +317,21 @@ NAV_MAX_LINEAR=0.15 TAGS_ENABLED=0 ./start.sh
 reads and writes `map.json` and `config.json` in the current schema, imports the
 legacy one, edits tags per panel, and validates duplicate IDs, tags overhanging
 a panel face, overlapping panels, and an illegal start cell.
+
+
+1. Ensure center emergency stop button is depressed and rightmost is instead engaged - then press leftmost metal latching switch to turn on power, a green ring should illuminate 
+2. Press & hold Power button on battery pack until screen illuminates then press “Switch” button once to turn on AC power distribution- the power draw should quickly get up to approx. 26W
+3. Connect to “ICSL-Exp” WiFi network- password “Icslicsl”
+4. ssh icsl@192.168.0.100 - password “Icslicsl”
+5. cd /home/icsl/workspace/flirone-v4l2/ && sudo scripts/load_v4l2loopback [PASSWORD]
+6. screen [ENTER]
+7. sudo ./flirone palettes/Grayscale.raw - [CTRL + A + D] to disconnect process
+8. screen [ENTER]
+9. roslaunch turn_on_wheeltec_robot turn_on_wheeltec_robot.launch  - [CTRL + A + D] to disconnect process
+10. Two buttons on the usb hub on the gimbal arm should be deactivated- turn them on now with short presses to connect the T265 and D435i to the Orin (remember these will have to be manually turned off by holding the respective buttons before the next shutdown/reboot)
+11. Start the Web UI with the command: /home/icsl/claude_related/demo_mk4/rover_ui/start.sh - it should return a series of IP addresses for the newly running services upon successful execution. The stop.sh script in the selfsame directory (/home/icsl/claude_related/demo_mk4/rover_ui/stop.sh) halts the system (though a reboot in between UI activations is HIGHLY recommended).
+12. The Operator interface can be reached by navigating in a browser to 192.168.0.100:8000 with the audience interface being accessible at 192.168.0.100:8000/audience
+13. There are three metal latches on the gimbal which are currently engaged to lock the axes for transport which need to be released - while holding the sensor array in place, gently push each latch away from its respective motor stator until you hear a distinctive click and the rotating axis unlocks and begins to spin freely freeing the gimbal motors.
+14. While continuing to hold the sensor array - turn on the DJI gimbal by pressing and holding the side-mounted power button until the gimbal activates and centers the sensor array. 
+15. Release motor brake by rotating rightmost button clockwise until it automatically depresses 
+16. Rover is now ready - invert procedure to turn off
