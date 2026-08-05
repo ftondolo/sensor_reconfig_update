@@ -338,3 +338,5 @@ a panel face, overlapping panels, and an illegal start cell.
 14. While continuing to hold the sensor array - turn on the DJI gimbal by pressing and holding the side-mounted power button until the gimbal activates and centers the sensor array. 
 15. Release motor brake by rotating rightmost button clockwise until it automatically depresses 
 16. Rover is now ready - invert procedure to turn off
+
+---
