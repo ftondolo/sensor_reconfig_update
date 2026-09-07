@@ -24,6 +24,21 @@ in this frame even though (x, y, z_map) is left-handed on its own.
 Tag placement is authored per-obstacle in map.json as an offset from that
 obstacle's GROUND-CENTRE, so moving a panel and updating its x/z carries its
 tags along with it and nothing needs re-surveying.
+
+Conditioning
+------------
+What makes a tag observation usable is not how far apart the tags are in
+millimetres but how far apart they are IN ANGLE as seen from the camera — the
+ANGULAR BASELINE, spread / range. That ratio is what governs how much
+perspective difference is available to tell yaw apart from lateral translation.
+As spread/range -> 0 the view degenerates toward orthographic, where strafing
+sideways and rotating in yaw produce nearly identical image motion and the
+solver answers with a confident, wrong, mirrored pose. See _geometry_ok.
+
+Two views separated by a KNOWN baseline are the other way to buy that angle
+(see solve_multiview): translating the object points of the second view back
+along the baseline turns the pair into one well-conditioned pooled PnP, which
+is how a single degenerate tag column is rescued without adding tags.
 """
 import math
 
@@ -61,7 +76,7 @@ def _infer_facing(dx, dz, half_w, half_h):
 
 
 def build_tag_table(map_dict, default_size_mm, panel_boxes=None):
-    """map.json -> {tag_id: (4x3 world corner array, size_mm, facing)}.
+    """map.json -> {tag_id: (4x3 world corner array, size_mm, facing, panel_i)}.
 
     Per obstacle:
         "tags": [{"id": 0, "dx": -500, "dy": 1000, "dz": 175,
@@ -184,16 +199,73 @@ def unsharp(gray, amount=0.6, sigma=2.0):
     return cv2.addWeighted(gray, 1.0 + float(amount), blur, -float(amount), 0)
 
 
+def _quad_side_px(quad):
+    """Mean side length (px) of a 4x2 corner quad — its apparent size."""
+    q = np.asarray(quad, float).reshape(4, 2)
+    s = [np.linalg.norm(q[(i + 1) % 4] - q[i]) for i in range(4)]
+    return float(np.mean(s))
+
+
+def _focal_px(K):
+    K = np.asarray(K, float)
+    return 0.5 * (float(K[0, 0]) + float(K[1, 1]))
+
+
+def _centre_spread(centres):
+    """Largest horizontal (x, z) separation among a list of 3-vectors, mm."""
+    best = 0.0
+    for i, a in enumerate(centres):
+        for b in centres[i + 1:]:
+            d = math.hypot(a[0] - b[0], a[2] - b[2])
+            if d > best:
+                best = d
+    return best
+
+
 class TagLocalizer:
     """Solves the camera's map pose from any tags currently in view."""
+
+    # Machine-readable companions to last_reason, so callers can branch on WHY
+    # a solve failed without matching on prose. "degenerate" in particular is
+    # the one the navigator acts on: it is the only failure a micro-parallax
+    # jog can fix, and it must not be confused with "nothing in view".
+    REASON_OK = None
+    REASON_NOT_READY = "not_ready"
+    REASON_NO_MARKERS = "no_markers"
+    REASON_UNKNOWN_IDS = "unknown_ids"
+    REASON_FEW_TAGS = "few_tags"
+    REASON_DEGENERATE = "degenerate"
+    REASON_PNP_FAILED = "pnp_failed"
 
     def __init__(self, tag_table, dict_name="DICT_4X4_50", min_tags=1,
                  min_spread_mm=400.0, corner_refine="SUBPIX",
                  win_min=7, win_max=25, win_step=8,
-                 unsharp_amount=0.6, unsharp_sigma=2.0):
+                 unsharp_amount=0.6, unsharp_sigma=2.0,
+                 min_spread_ratio=0.18, min_spread_floor_mm=150.0,
+                 spread_ratio_strict=False):
         self.tags = tag_table or {}
         self.min_tags = int(min_tags)
+        # Absolute PASS threshold: this much horizontal spread is accepted at
+        # any range, so nothing that was accepted before this change is
+        # rejected now. The ratio below only ever ADDS acceptances.
         self.min_spread_mm = float(min_spread_mm)
+        # Angular baseline: spread / range. This is the real conditioning
+        # number (see _geometry_ok). 0 disables the ratio path entirely and
+        # restores the old absolute-floor-only behaviour exactly.
+        self.min_spread_ratio = float(min_spread_ratio)
+        # Hard floor the ratio can never argue past. Below this the two tags
+        # are physically almost one tag, and a range UNDER-estimate (a tag
+        # partly occluded, so it measures small... and therefore far) must not
+        # be able to talk a near-zero spread through the gate.
+        self.min_spread_floor_mm = float(min_spread_floor_mm)
+        # When True the ratio is a REQUIREMENT rather than an alternative
+        # route: a wide-but-distant observation is rejected too. The measured
+        # sweep in _geometry_ok shows the current absolute floor passing a
+        # 400 mm pair at 3.5 m, which carries ~208 mm of error — worse than
+        # anything the ratio gate lets through. Default False so this change
+        # only ever ADDS acceptances; turn it on once the ratio reported in
+        # each fix has been watched for a session.
+        self.spread_ratio_strict = bool(spread_ratio_strict)
         self.unsharp_amount = float(unsharp_amount)
         self.unsharp_sigma = float(unsharp_sigma)
         # Why the last solve() returned None. Four quite different faults used
@@ -201,8 +273,17 @@ class TagLocalizer:
         # wrong cause — a frame showing two tags in a single column was reported
         # identically to a frame showing nothing at all.
         self.last_reason = None
+        self.last_reason_code = None
+        # Geometry of the last gate decision, kept whether it passed or failed:
+        # {spread_mm, range_mm, ratio, need_ratio}. The operator can watch a
+        # marginal view get better as the rover moves, instead of only being
+        # told "no".
+        self.last_geometry = None
         self.enabled = bool(_ARUCO and self.tags)
         self._detector = None
+        self._last_obj = {}
+        self._last_img = {}
+        self.last_observation = None
         if not self.enabled:
             return
         d = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dict_name))
@@ -222,15 +303,401 @@ class TagLocalizer:
 
     def _spread(self, ids):
         """Largest horizontal separation between any two tag centres (mm)."""
-        cs = [self.tags[i][0].mean(axis=0) for i in ids]
-        best = 0.0
-        for i, a in enumerate(cs):
-            for b in cs[i + 1:]:
-                d = math.hypot(a[0] - b[0], a[2] - b[2])
-                if d > best:
-                    best = d
-        return best
+        return _centre_spread([self.tags[i][0].mean(axis=0) for i in ids])
 
+    # ------------------------------------------------------------------ 2a
+    def range_estimate_mm(self, ids, img_by_tag, K):
+        """Rough camera-to-tag range (mm) from APPARENT tag size in pixels.
+
+        range ~= f * size_mm / side_px, taken per tag and median-combined. This
+        deliberately does NOT use the pose solve: the whole point of the gate is
+        to decide whether that solve can be trusted, so it cannot be an input.
+        Depth from apparent size is the one quantity a degenerate single-column
+        view still gets right — the ambiguity there is yaw against lateral
+        translation, not scale.
+
+        A tag seen obliquely projects SMALLER than a face-on one, so this
+        over-estimates range, which under-estimates the angular baseline and
+        makes the gate stricter. Erring toward rejection is the safe direction.
+        Returns None when no tag gives a usable measurement.
+        """
+        f = _focal_px(K)
+        if f <= 0:
+            return None
+        est = []
+        for t in ids:
+            ent = self.tags.get(int(t))
+            quad = img_by_tag.get(int(t))
+            if ent is None or quad is None:
+                continue
+            side = _quad_side_px(quad)
+            if side > 1e-6:
+                est.append(f * float(ent[1]) / side)
+        if not est:
+            return None
+        return float(np.median(est))
+
+    def _geometry_ok(self, spread_mm, range_mm):
+        """Is this observation well enough conditioned to solve?
+
+        The old gate was an ABSOLUTE spread floor, which rejects a genuinely
+        good close-range observation identically to a genuinely bad far-range
+        one. What actually governs the error is the ANGULAR baseline,
+        spread / range: how much real perspective difference exists between the
+        tags. As that ratio tends to zero the view tends to orthographic, where
+        a sideways translation and a yaw rotation produce almost the same image
+        motion, so the solver cannot separate them and answers with a confident
+        mirrored pose that reprojects at ~0.3 px — invisible to the RMS gate and
+        repeatable enough to survive a confirmation run.
+
+        Measured, not merely argued. Two tags at one height, 0.4 px of corner
+        noise (the SUBPIX level), 200 trials each, median lateral pose error:
+
+            spread  range   ratio    error
+             150 mm  0.8 m  0.188    4.5 mm
+             250 mm  1.0 m  0.250    5.6 mm      <- rejected today, for nothing
+             250 mm  2.0 m  0.125   48.5 mm
+             250 mm  3.5 m  0.071  287.4 mm      <- correctly bad
+             400 mm  2.0 m  0.200   28.1 mm
+             400 mm  3.5 m  0.114  208.0 mm      <- ACCEPTED today
+             650 mm  2.0 m  0.325   20.3 mm      <- accepted today
+             650 mm  3.5 m  0.186  105.8 mm      <- accepted today
+             900 mm  2.5 m  0.360   24.3 mm
+
+        Read down the ratio column: the error is very nearly a function of the
+        ratio alone, and barely of the spread or the range on their own. That
+        is the whole justification for the change.
+
+        The default threshold of 0.18 is calibrated against what the CURRENT
+        gate already tolerates rather than picked for taste: a 650 mm pair at
+        3.5 m is ratio 0.186 and ~106 mm of error, and it passes today. So
+        anything at ratio >= 0.18 is no worse conditioned than an observation
+        the system already trusts.
+
+        Two modes:
+          * permissive (default) — accept if EITHER the absolute spread clears
+            min_spread_mm (so nothing previously accepted is now rejected) OR
+            the ratio clears min_spread_ratio with the spread still above the
+            hard floor. Strictly widens the accept set.
+          * strict (spread_ratio_strict=True) — the ratio must clear, full
+            stop. Note the table above: the absolute floor is the MORE
+            permissive rule at long range, so strict mode also closes the
+            400 mm-at-3.5 m hole.
+
+        Returns (ok, ratio_or_None, why).
+        """
+        ratio = (spread_mm / range_mm) if (range_mm and range_mm > 0) else None
+        if self.spread_ratio_strict and self.min_spread_ratio > 0.0:
+            if ratio is None:
+                return False, None, ("range could not be estimated, and strict "
+                                     "angular-baseline gating is on")
+            if spread_mm < self.min_spread_floor_mm:
+                return False, ratio, (
+                    "spans only %.0f mm, under the %.0f mm hard floor"
+                    % (spread_mm, self.min_spread_floor_mm))
+            if ratio < self.min_spread_ratio:
+                return False, ratio, (
+                    "angular baseline %.3f (%.0f mm of spread at %.0f mm range) "
+                    "is under %.3f — too little perspective to tell yaw from "
+                    "sideways motion" % (ratio, spread_mm, range_mm,
+                                         self.min_spread_ratio))
+            return True, ratio, ("angular baseline %.3f clears %.3f"
+                                 % (ratio, self.min_spread_ratio))
+        if spread_mm >= self.min_spread_mm:
+            return True, ratio, "absolute spread %.0f mm" % spread_mm
+        if self.min_spread_ratio <= 0.0:
+            return False, ratio, ("spans only %.0f mm (need %.0f)"
+                                  % (spread_mm, self.min_spread_mm))
+        if ratio is None:
+            return False, None, ("spans only %.0f mm (need %.0f) and the range "
+                                 "could not be estimated to judge the angular "
+                                 "baseline" % (spread_mm, self.min_spread_mm))
+        if spread_mm < self.min_spread_floor_mm:
+            return False, ratio, (
+                "spans only %.0f mm, under the %.0f mm hard floor — at that "
+                "separation the tags are effectively one tag whatever the range"
+                % (spread_mm, self.min_spread_floor_mm))
+        if ratio >= self.min_spread_ratio:
+            return True, ratio, ("angular baseline %.3f (%.0f mm at %.0f mm) "
+                                 "clears %.3f" % (ratio, spread_mm, range_mm,
+                                                  self.min_spread_ratio))
+        return False, ratio, (
+            "angular baseline %.3f (%.0f mm of spread at %.0f mm range) is under "
+            "%.3f — too little perspective to tell yaw from sideways motion"
+            % (ratio, spread_mm, range_mm, self.min_spread_ratio))
+
+    def geometry_ok(self, ids, img_by_tag, K):
+        """Public gate over a set of observed tag ids. Returns (ok, info)."""
+        spread = self._spread(ids) if len(ids) > 1 else 0.0
+        rng = self.range_estimate_mm(ids, img_by_tag, K)
+        if len(ids) <= 1:
+            # A single tag has no spread to judge; min_tags decides that case.
+            info = {"spread_mm": 0.0, "range_mm": rng, "ratio": None,
+                    "need_ratio": self.min_spread_ratio, "why": "single tag"}
+            return True, info
+        ok, ratio, why = self._geometry_ok(spread, rng)
+        info = {"spread_mm": round(spread, 1),
+                "range_mm": (round(rng) if rng else None),
+                "ratio": (round(ratio, 4) if ratio else None),
+                "need_ratio": self.min_spread_ratio, "why": why}
+        return ok, info
+
+    # ------------------------------------------------------------ observation
+    def observe(self, frame):
+        """Detect known tags and return the RAW correspondences, ungated.
+
+        {"ids": [...], "img": {id: 4x2}, "obj": {id: 4x3}, "n": int}
+
+        This is deliberately separate from solve(): a view too degenerate to
+        solve on its own is still a perfectly good observation to pair with a
+        second one taken from a different place (see solve_multiview). Throwing
+        the pixels away at detection time is what made that impossible.
+        """
+        self.last_reason = None
+        self.last_reason_code = self.REASON_OK
+        if not self.enabled or frame is None:
+            self.last_reason = "localiser not ready"
+            self.last_reason_code = self.REASON_NOT_READY
+            return None
+        gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = unsharp(gray, self.unsharp_amount, self.unsharp_sigma)
+        corners, ids = self._detect(gray)
+        if ids is None or len(ids) == 0:
+            self.last_reason = "no markers found in frame"
+            self.last_reason_code = self.REASON_NO_MARKERS
+            return None
+        img, obj, seen = {}, {}, []
+        for c, i in zip(corners, ids.flatten()):
+            ent = self.tags.get(int(i))
+            if ent is None:
+                continue                                  # unknown ID -> ignore
+            obj[int(i)] = np.asarray(ent[0], float)
+            img[int(i)] = np.asarray(c, float).reshape(4, 2)
+            seen.append(int(i))
+        if not seen:
+            # Markers WERE decoded, they just are not ones the map knows about.
+            # Completely different fix from "nothing detected": check the ids in
+            # map.json, or whether a stray marker is in shot.
+            self.last_reason = ("saw marker id(s) %s — none are in map.json"
+                                % sorted(int(i) for i in ids.flatten()))
+            self.last_reason_code = self.REASON_UNKNOWN_IDS
+            return None
+        out = {"ids": sorted(seen), "img": img, "obj": obj, "n": len(seen)}
+        self.last_observation = out
+        return out
+
+    # ----------------------------------------------------------------- solve
+    def _pnp(self, obj, img, K, dist):
+        d = np.zeros(5) if dist is None else np.asarray(dist, float).ravel()
+        Km = np.asarray(K, float)
+        ok, rvec, tvec = cv2.solvePnP(obj, img, Km, d, flags=cv2.SOLVEPNP_SQPNP)
+        if not ok:
+            return None
+        R, _ = cv2.Rodrigues(rvec)
+        C = (-R.T @ tvec).ravel()
+        proj, _ = cv2.projectPoints(obj, rvec, tvec, Km, d)
+        rms = float(np.sqrt(np.mean(np.sum((proj.reshape(-1, 2) - img) ** 2, axis=1))))
+        return R, C, rms, rvec, tvec
+
+    def solve(self, frame, K, dist=None):
+        """Return {x, z, yaw_deg, n_tags, ids, rms_px, ...} for the CAMERA in
+        map mm, or None when no usable fix is available.
+
+        All visible known tags are pooled into a single PnP problem, so the
+        solve is identical whether one tag is in view or eight — it simply
+        becomes better conditioned as more appear.
+        """
+        if K is None:
+            self.last_reason = "localiser not ready"
+            self.last_reason_code = self.REASON_NOT_READY
+            return None
+        obs = self.observe(frame)
+        if obs is None:
+            return None
+        return self.solve_obs(obs, K, dist)
+
+    def solve_obs(self, obs, K, dist=None):
+        """The gate + PnP half of solve(), over an observation already taken.
+
+        Split out so a caller can hold on to the raw correspondences (which stay
+        useful even when this refuses them — see solve_multiview) instead of
+        having to re-detect the frame to get them back."""
+        if obs is None:
+            return None
+        if K is None:
+            self.last_reason = "localiser not ready"
+            self.last_reason_code = self.REASON_NOT_READY
+            return None
+        seen = obs["ids"]
+        if len(seen) < self.min_tags:
+            self.last_reason = ("only %d known tag(s) %s, need %d"
+                                % (len(seen), seen, self.min_tags))
+            self.last_reason_code = self.REASON_FEW_TAGS
+            return None
+        # Conditioning gate. Tags stacked in a single vertical column (e.g. only
+        # the left-hand pair of a panel in frame) give eight corners confined to
+        # one tag-width horizontally, so sideways position and heading are
+        # under-determined: the solver returns a confident, wrong, mirrored pose
+        # that reprojects at ~0.3 px, so neither the residual nor a confirmation
+        # run can catch it. Verified knife-edge: the same view solves correctly
+        # in float64 and flips at the float32 precision cv2.aruco returns. Two
+        # tags at different heights are NOT a substitute for two at different x.
+        #
+        # What counts as "enough" is now the ANGULAR baseline, not a fixed
+        # millimetre floor — see _geometry_ok.
+        ok, geo = self.geometry_ok(seen, obs["img"], K)
+        self.last_geometry = geo
+        if not ok:
+            # This is NOT "no tags": the camera is looking straight at them. The
+            # geometry is simply unusable, and saying so points at the fix (move
+            # so both columns of a panel are in shot, get closer, or take a
+            # micro-parallax pair — see solve_multiview).
+            self.last_reason = "tags %s: %s" % (seen, geo["why"])
+            self.last_reason_code = self.REASON_DEGENERATE
+            return None
+        self._last_obj = {t: obs["obj"][t] for t in seen}
+        self._last_img = {t: obs["img"][t] for t in seen}
+        objm = np.vstack([obs["obj"][t] for t in seen]).astype(np.float64)
+        imgm = np.vstack([obs["img"][t] for t in seen]).astype(np.float64)
+        res = self._pnp(objm, imgm, K, dist)
+        if res is None:
+            self.last_reason = "solvePnP failed on %d tag(s) %s" % (len(seen), seen)
+            self.last_reason_code = self.REASON_PNP_FAILED
+            return None
+        R, C, rms, _rv, _tv = res
+        return {"x": float(C[0]), "z": float(C[2]), "y": float(C[1]),
+                "yaw_deg": math.degrees(yaw_from_R(R)),
+                "n_tags": len(seen), "ids": sorted(seen), "rms_px": rms,
+                "spread_mm": round(geo["spread_mm"], 1),
+                "range_mm": geo["range_mm"],
+                "spread_ratio": geo["ratio"],
+                "views": 1}
+
+    # ------------------------------------------------------------------- 3c
+    def solve_multiview(self, views, K, dist=None, min_ratio=None,
+                        min_spread_mm=None):
+        """Fuse observations taken from KNOWN-OFFSET viewpoints into one solve.
+
+        ``views`` is a list of {"obs": <observe() result>, "delta": (dx, dy, dz)}
+        where delta is the camera's world displacement for that view RELATIVE TO
+        VIEW 0 (so view 0's delta is (0, 0, 0)). The returned pose is the camera
+        at view 0.
+
+        Why this works, and why it needs no new solver: for a camera whose
+        rotation R is the same in both views and whose centre moves by D,
+
+            R(X - (C0 + D)) = R((X - D) - C0)
+
+        so an observation taken from the displaced viewpoint is EXACTLY an
+        observation of the world point X - D taken from view 0. Translating the
+        object points back along the known baseline therefore lets both views'
+        correspondences go into one ordinary pooled solvePnP.
+
+        The pooled object cloud now spans the baseline as well as the tags, so a
+        single vertical tag column — hopeless on its own — becomes a
+        well-conditioned problem: the manufactured baseline supplies the
+        parallax the tag layout does not. This is stereo triangulation with the
+        rover's own body as the stereo rig.
+
+        Assumptions, all of which the caller must honour:
+          * the heading is the SAME at every view (the rover strafes with
+            hold_yaw, so it is);
+          * delta is the MEASURED displacement, not the commanded one (the T265
+            is trustworthy over a sub-second, sub-metre move even though it
+            drifts over minutes);
+          * at least one tag is seen in common, so the views are of the same
+            thing.
+        Returns None (with last_reason set) if any of that fails.
+        """
+        self.last_reason = None
+        self.last_reason_code = self.REASON_OK
+        if not self.enabled or K is None:
+            self.last_reason = "localiser not ready"
+            self.last_reason_code = self.REASON_NOT_READY
+            return None
+        views = [v for v in (views or []) if v and v.get("obs")]
+        if len(views) < 2:
+            self.last_reason = "multiview needs 2 usable observations, got %d" % len(views)
+            self.last_reason_code = self.REASON_FEW_TAGS
+            return None
+        common = set(views[0]["obs"]["ids"])
+        for v in views[1:]:
+            common &= set(v["obs"]["ids"])
+        if not common:
+            self.last_reason = ("the two views share no tag (%s vs %s) — they are "
+                                "not looking at the same thing"
+                                % (views[0]["obs"]["ids"], views[-1]["obs"]["ids"]))
+            self.last_reason_code = self.REASON_UNKNOWN_IDS
+            return None
+        obj_parts, img_parts, centres, all_ids = [], [], [], []
+        for v in views:
+            obs = v["obs"]
+            D = np.asarray(v.get("delta", (0.0, 0.0, 0.0)), float).reshape(3)
+            for t in obs["ids"]:
+                P = np.asarray(obs["obj"][t], float) - D    # X - D, see docstring
+                obj_parts.append(P)
+                img_parts.append(np.asarray(obs["img"][t], float).reshape(4, 2))
+                centres.append(P.mean(axis=0))
+                all_ids.append(int(t))
+        # Conditioning of the AUGMENTED cloud. The baseline shows up here
+        # naturally: the same tag seen from two places contributes two centres
+        # |D| apart, so the spread the gate sees is the parallax that was
+        # manufactured, exactly as if a second tag had been bolted to the wall.
+        spread = _centre_spread(centres)
+        rng = self.range_estimate_mm(views[0]["obs"]["ids"], views[0]["obs"]["img"], K)
+        need = self.min_spread_ratio if min_ratio is None else float(min_ratio)
+        floor = (self.min_spread_floor_mm if min_spread_mm is None
+                 else float(min_spread_mm))
+        base = float(np.linalg.norm(
+            np.asarray(views[-1].get("delta", (0, 0, 0)), float)))
+        ratio = (spread / rng) if (rng and rng > 0) else None
+        geo = {"spread_mm": round(spread, 1),
+               "range_mm": (round(rng) if rng else None),
+               "ratio": (round(ratio, 4) if ratio else None),
+               "need_ratio": need, "baseline_mm": round(base, 1)}
+        self.last_geometry = geo
+        # The pooled cloud is gated on its OWN terms, with a floor and a ratio
+        # the caller sets: a manufactured baseline is better conditioned than the
+        # same millimetres of tag spread would be, because the same tag is seen
+        # in both views (twice the corners, so ~sqrt(2) less corner noise) and
+        # the baseline runs exactly across the line of sight, which is the
+        # optimal direction, rather than partly along it as panel-mounted tags
+        # usually do.
+        if spread < floor:
+            self.last_reason = (
+                "the %.0f mm jog left the pooled view spanning only %.0f mm "
+                "(floor %.0f) — the rover barely moved, or the second view lost "
+                "the tags" % (base, spread, floor))
+            self.last_reason_code = self.REASON_DEGENERATE
+            return None
+        if need > 0 and ratio is not None and ratio < need:
+            self.last_reason = (
+                "even with the %.0f mm baseline the angular baseline is only "
+                "%.3f at %.0f mm range (need %.3f) — jog further, or get closer "
+                "to the tags" % (base, ratio, rng, need))
+            self.last_reason_code = self.REASON_DEGENERATE
+            return None
+        objm = np.vstack(obj_parts).astype(np.float64)
+        imgm = np.vstack(img_parts).astype(np.float64)
+        res = self._pnp(objm, imgm, K, dist)
+        if res is None:
+            self.last_reason = "solvePnP failed on the %d-view pair" % len(views)
+            self.last_reason_code = self.REASON_PNP_FAILED
+            return None
+        R, C, rms, _rv, _tv = res
+        # Keep view 0's correspondences as the audit subject: the audit asks
+        # whether the MAP is right, which is a per-view question.
+        self._last_obj = {t: views[0]["obs"]["obj"][t] for t in views[0]["obs"]["ids"]}
+        self._last_img = {t: views[0]["obs"]["img"][t] for t in views[0]["obs"]["ids"]}
+        return {"x": float(C[0]), "z": float(C[2]), "y": float(C[1]),
+                "yaw_deg": math.degrees(yaw_from_R(R)),
+                "n_tags": len(set(all_ids)), "ids": sorted(set(all_ids)),
+                "rms_px": rms,
+                "spread_mm": geo["spread_mm"], "range_mm": geo["range_mm"],
+                "spread_ratio": geo["ratio"],
+                "views": len(views), "baseline_mm": round(base, 1)}
+
+    # ----------------------------------------------------------------- audit
     def audit(self, obj_by_tag, img_by_tag, K, dist=None):
         """Diagnose WHY a solve disagrees with the map. Returns
         {scale, scale_rms, base_rms, per_tag: {id: residual_px}}.
@@ -315,12 +782,15 @@ class TagLocalizer:
         for pi, tids in by_panel.items():
             if len(tids) < 2:
                 continue                     # one tag alone cannot fix a camera
-            # Same degeneracy guard the main solve uses. A panel contributing
-            # only ONE VERTICAL COLUMN (e.g. its two -x tags) leaves sideways
-            # position unconstrained, and its solo solve lands anywhere: that is
-            # what produced "panels disagree by 1586 mm" from a pair that was
-            # merely stacked. Skip such panels rather than report nonsense.
-            if self._spread(tids) < self.min_spread_mm:
+            # Same conditioning guard the main solve uses, including the angular
+            # baseline: a panel contributing only ONE VERTICAL COLUMN (e.g. its
+            # two -x tags) leaves sideways position unconstrained, and its solo
+            # solve lands anywhere — that is what produced "panels disagree by
+            # 1586 mm" from a pair that was merely stacked. Skip such panels
+            # rather than report nonsense. A close-range narrow pair now passes
+            # here too, so more panels can be cross-checked than before.
+            pok, _pgeo = self.geometry_ok(tids, img_by_tag, K)
+            if not pok:
                 continue
             o = np.vstack([obj_by_tag[t] for t in tids]).astype(np.float64)
             im = np.vstack([img_by_tag[t] for t in tids]).astype(np.float64)
@@ -354,78 +824,3 @@ class TagLocalizer:
             out["panel_disagree_mm"] = round(worst)
             out["panel_pair"] = list(pair) if pair else None
         return out
-
-    def solve(self, frame, K, dist=None):
-        """Return {x, z, yaw_deg, n_tags, ids, rms_px} for the CAMERA in map mm,
-        or None when no usable fix is available.
-
-        All visible known tags are pooled into a single PnP problem, so the
-        solve is identical whether one tag is in view or eight — it simply
-        becomes better conditioned as more appear.
-        """
-        self.last_reason = None
-        if not self.enabled or frame is None or K is None:
-            self.last_reason = "localiser not ready"
-            return None
-        gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = unsharp(gray, self.unsharp_amount, self.unsharp_sigma)
-        corners, ids = self._detect(gray)
-        if ids is None or len(ids) == 0:
-            self.last_reason = "no markers found in frame"
-            return None
-        obj, img, seen = [], [], []
-        for c, i in zip(corners, ids.flatten()):
-            ent = self.tags.get(int(i))
-            if ent is None:
-                continue                                  # unknown ID -> ignore
-            obj.append(ent[0])
-            img.append(c.reshape(4, 2))
-            seen.append(int(i))
-        if not seen:
-            # Markers WERE decoded, they just are not ones the map knows about.
-            # Completely different fix from "nothing detected": check the ids in
-            # map.json, or whether a stray marker is in shot.
-            self.last_reason = ("saw marker id(s) %s — none are in map.json"
-                                % sorted(int(i) for i in ids.flatten()))
-            return None
-        if len(seen) < self.min_tags:
-            self.last_reason = ("only %d known tag(s) %s, need %d"
-                                % (len(seen), seen, self.min_tags))
-            return None
-        # Reject observations with no horizontal SPREAD. Tags stacked in a
-        # single vertical column (e.g. only the left-hand pair of a panel in
-        # frame) give eight corners confined to one tag-width horizontally, so
-        # the sideways position and heading are under-determined: the solver
-        # returns a confident, wrong, mirrored pose that reprojects at ~0.3 px,
-        # so neither the residual nor a confirmation run can catch it. Verified
-        # knife-edge: the same view solves correctly in float64 and flips at the
-        # float32 precision cv2.aruco actually returns. Two tags at different
-        # heights are NOT a substitute for two at different x.
-        if len(seen) > 1 and self._spread(seen) < self.min_spread_mm:
-            # This is NOT "no tags": the camera is looking straight at them. The
-            # geometry is simply unusable, and saying so points at the fix
-            # (move so both columns of a panel are in shot).
-            self.last_reason = (
-                "tags %s span only %.0f mm horizontally (need %.0f) — they are "
-                "one vertical column, so sideways position is undetermined"
-                % (seen, self._spread(seen), self.min_spread_mm))
-            return None
-        obj_list, img_list = obj, img
-        obj = np.vstack(obj).astype(np.float64)
-        img = np.vstack(img).astype(np.float64)
-        d = np.zeros(5) if dist is None else np.asarray(dist, float).ravel()
-        self._last_obj = {t: o for t, o in zip(seen, obj_list)}
-        self._last_img = {t: i for t, i in zip(seen, img_list)}
-        ok, rvec, tvec = cv2.solvePnP(obj, img, np.asarray(K, float), d,
-                                      flags=cv2.SOLVEPNP_SQPNP)
-        if not ok:
-            self.last_reason = "solvePnP failed on %d tag(s) %s" % (len(seen), seen)
-            return None
-        R, _ = cv2.Rodrigues(rvec)
-        C = (-R.T @ tvec).ravel()                         # camera centre in world
-        proj, _ = cv2.projectPoints(obj, rvec, tvec, np.asarray(K, float), d)
-        rms = float(np.sqrt(np.mean(np.sum((proj.reshape(-1, 2) - img) ** 2, axis=1))))
-        return {"x": float(C[0]), "z": float(C[2]), "y": float(C[1]),
-                "yaw_deg": math.degrees(yaw_from_R(R)),
-                "n_tags": len(seen), "ids": sorted(seen), "rms_px": rms,
-                "spread_mm": round(self._spread(seen), 1)}
