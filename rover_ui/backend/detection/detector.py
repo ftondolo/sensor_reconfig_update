@@ -88,8 +88,16 @@ class DetectorThread(SensorThread):
         self._tag_fix = None
         self._tag_t = 0.0
         self._tag_idle = None      # why no fix is being produced, for the UI
+        self._tag_reason = None    # machine-readable companion to _tag_idle
         self._tag_audit_t = 0.0    # last time the (expensive) audit was run
         self._tag_audit_last = None  # keep the last verdict between audits
+        # Latest RAW tag correspondences, kept whether or not they were good
+        # enough to solve. A view too degenerate to solve alone is still a
+        # perfectly good half of a micro-parallax pair, and discarding the
+        # pixels at detection time is what made that impossible. Guarded by its
+        # own lock because the navigator reads it from another thread.
+        self._tag_obs = None       # {"t": float, "obs": {...} or None}
+        self._tag_obs_lock = threading.Lock()
         self._thermal_sensor = thermal_sensor
         self._radar_sensor = radar_sensor
         self.telemetry = LatestValue()
@@ -487,6 +495,10 @@ class DetectorThread(SensorThread):
         self._tag_step(rgb)
         tel["tag_fix"] = self._tag_fix
         tel["tag_idle"] = self._tag_idle
+        # Machine-readable companion to tag_idle, so the navigator can branch on
+        # "degenerate" (the one failure a parallax jog can fix) without matching
+        # on prose that is written for a human.
+        tel["tag_reason"] = self._tag_reason
         self.telemetry.set(tel)
 
         self._frame_i += 1
@@ -1065,7 +1077,12 @@ class DetectorThread(SensorThread):
                     win_max=int(config.TAGS_THRESH_WIN_MAX),
                     win_step=int(config.TAGS_THRESH_WIN_STEP),
                     unsharp_amount=float(config.TAGS_UNSHARP_AMOUNT),
-                    unsharp_sigma=float(config.TAGS_UNSHARP_SIGMA))
+                    unsharp_sigma=float(config.TAGS_UNSHARP_SIGMA),
+                    # Angular-baseline gate: a narrow spread is fine up close
+                    # and useless far away, and only the ratio knows which.
+                    min_spread_ratio=float(config.TAGS_MIN_SPREAD_RATIO),
+                    min_spread_floor_mm=float(config.TAGS_MIN_SPREAD_FLOOR_MM),
+                    spread_ratio_strict=bool(config.TAGS_SPREAD_RATIO_STRICT))
                 if not self._tagloc.enabled:
                     print("[detector] tag localiser idle (no tags in map.json "
                           "or cv2.aruco unavailable)")
@@ -1086,8 +1103,17 @@ class DetectorThread(SensorThread):
                       "from the D435 (camera in mock mode, or open() failed)")
             self._tag_idle = "no camera intrinsics"
             return
+        dist = getattr(self._rgb_sensor, "color_dist", None)
         try:
-            fix = self._tagloc.solve(rgb, K, getattr(self._rgb_sensor, "color_dist", None))
+            # Detect ONCE, then gate and solve from what came back. The raw
+            # correspondences are published either way: a frame the gate refuses
+            # is exactly the frame micro-parallax wants to pair with a second
+            # viewpoint, so it must not be thrown away here.
+            obs = self._tagloc.observe(rgb)
+            with self._tag_obs_lock:
+                self._tag_obs = {"t": now, "obs": obs,
+                                 "reason": getattr(self._tagloc, "last_reason_code", None)}
+            fix = self._tagloc.solve_obs(obs, K, dist) if obs is not None else None
         except Exception as e:
             print("[detector] tag solve failed: %s" % e)
             return
@@ -1096,6 +1122,8 @@ class DetectorThread(SensorThread):
         self._tag_idle = (None if fix is not None
                           else (getattr(self._tagloc, "last_reason", None)
                                 or "no known tags in view"))
+        self._tag_reason = (None if fix is not None
+                            else getattr(self._tagloc, "last_reason_code", None))
         if fix is not None:
             fix["t"] = now
             # When the solve disagrees with the map, work out WHY. A wrong tag
@@ -1112,8 +1140,7 @@ class DetectorThread(SensorThread):
                 self._tag_audit_t = now
                 try:
                     a = self._tagloc.audit(self._tagloc._last_obj,
-                                           self._tagloc._last_img, K,
-                                           getattr(self._rgb_sensor, "color_dist", None))
+                                           self._tagloc._last_img, K, dist)
                     if a:
                         fix["audit"] = a
                         dis = a.get("panel_disagree_mm")
@@ -1157,6 +1184,74 @@ class DetectorThread(SensorThread):
             elif self._tag_audit_last is not None:
                 fix["audit"] = self._tag_audit_last   # last known diagnosis
         self._tag_fix = fix
+
+    # ------------------------------------------------------- micro-parallax
+    def tag_observation(self, newer_than=0.0, timeout=0.0, poll=0.05):
+        """Latest RAW tag observation, optionally waiting for a FRESH one.
+
+        Returns {"t", "obs", "reason"} where obs is the observe() dict, or None
+        if nothing arrived in time. ``newer_than`` is a time.time() stamp: pass
+        the moment the rover finished settling so a stale pre-move frame cannot
+        be mistaken for the post-move view — that mistake would silently make
+        the baseline zero and hand back a confidently wrong fusion.
+
+        The detector runs its tag step at TAGS_DETECT_HZ, so a fresh view is at
+        most ~1/HZ away plus the camera's own latency.
+        """
+        deadline = time.time() + max(0.0, float(timeout))
+        while True:
+            with self._tag_obs_lock:
+                cur = self._tag_obs
+            if cur is not None and cur.get("t", 0.0) > float(newer_than) \
+                    and cur.get("obs") is not None:
+                return dict(cur)
+            if time.time() >= deadline:
+                return None
+            time.sleep(float(poll))
+
+    def tag_solve_views(self, views, min_ratio=None, min_spread_mm=None):
+        """Fuse observations from known-offset viewpoints into one pose.
+
+        The detector owns the localiser and the intrinsics, so the fusion runs
+        here and the navigator only supplies the geometry (which observation was
+        taken where). Returns (fix, reason): fix is None when the pair is not
+        usable, and reason then says why in the operator's terms.
+        """
+        if not self._tagloc:
+            return None, "localiser unavailable"
+        K = getattr(self._rgb_sensor, "color_K", None)
+        if K is None:
+            return None, "no camera intrinsics"
+        try:
+            fix = self._tagloc.solve_multiview(
+                views, K, getattr(self._rgb_sensor, "color_dist", None),
+                min_ratio=min_ratio, min_spread_mm=min_spread_mm)
+        except Exception as e:                      # pragma: no cover - defensive
+            return None, "multiview solve failed: %s" % e
+        if fix is None:
+            return None, (getattr(self._tagloc, "last_reason", None)
+                          or "multiview solve refused")
+        fix["t"] = time.time()
+        fix["source"] = "parallax"
+        return fix, None
+
+    def tag_range_mm(self):
+        """Estimated range (mm) to the tags in the latest observation, or None.
+
+        Used to SIZE the parallax jog before making it: the useful baseline is a
+        fraction of the range, not a fixed number of millimetres."""
+        if not self._tagloc:
+            return None
+        K = getattr(self._rgb_sensor, "color_K", None)
+        with self._tag_obs_lock:
+            cur = self._tag_obs
+        if K is None or not cur or not cur.get("obs"):
+            return None
+        try:
+            return self._tagloc.range_estimate_mm(cur["obs"]["ids"],
+                                                  cur["obs"]["img"], K)
+        except Exception:                           # pragma: no cover - defensive
+            return None
 
     def _telemetry(self, dets, settings, w, h, mock):
         if dets:
