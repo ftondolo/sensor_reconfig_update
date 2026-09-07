@@ -264,6 +264,13 @@ class JogBody(BaseModel):
     z: int = 0    # -1 = forward, +1 = back
 
 
+class ParallaxBody(BaseModel):
+    # Both optional: left unset, the jog is sized from the estimated range and
+    # the direction is whichever side has clear floor.
+    baseline_mm: Optional[float] = None
+    direction: Optional[str] = None      # "left" | "right"
+
+
 @app.post("/api/nav/go")
 def nav_go():
     ok, msg = nav.navigate_to_detection()
@@ -398,6 +405,31 @@ def nav_jog(body: JogBody):
 def nav_jog_stop():
     nav.jog_stop()
     return {"ok": True}
+
+
+@app.post("/api/nav/parallax")
+def nav_parallax(body: ParallaxBody = ParallaxBody()):
+    """Take a micro-parallax fix: jog sideways a known distance and fuse the two
+    views into one well-conditioned solve.
+
+    This is the rescue for a view that is degenerate by GEOMETRY — a single
+    vertical column of tags carries no sideways information, and no gate can
+    recover what was never measured. The rover manufactures the missing baseline
+    instead of waiting for a better view to come along. It moves the rover
+    (~120-350 mm sideways and, by default, back again), so it is refused while a
+    navigation is running.
+    """
+    if body.direction not in (None, "left", "right"):
+        return JSONResponse({"ok": False, "error": "direction must be 'left' or 'right'"},
+                            status_code=422)
+    if body.baseline_mm is not None and not (20.0 <= abs(body.baseline_mm) <= 600.0):
+        return JSONResponse({"ok": False, "error": "baseline_mm must be 20..600"},
+                            status_code=422)
+    ok, msg, detail = nav.parallax_fix(baseline_mm=body.baseline_mm,
+                                       direction=body.direction)
+    code = 200 if ok else 409
+    return JSONResponse({"ok": ok, "message": msg, "parallax": detail,
+                         "nav": nav.state()}, status_code=code)
 
 
 @app.post("/api/nav/nudge")
