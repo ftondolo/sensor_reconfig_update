@@ -146,6 +146,17 @@ $("btn-home").onclick = async () => {
   if (j && j.nav) { setFollow(j.nav.follow); setAuto(j.nav.auto); }
 };
 $("btn-reset").onclick = () => post("/api/nav/reset_pose", {});
+$("btn-parallax").onclick = async () => {
+  const b = $("btn-parallax");
+  b.disabled = true;
+  b.textContent = "\u21c4 jogging for a baseline\u2026";
+  try {
+    await post("/api/nav/parallax", {});
+  } finally {
+    b.disabled = false;
+    b.textContent = "\u21c4 Micro-parallax fix";
+  }
+};
 $("btn-reload").onclick = async () => {
   const j = await post("/api/nav/reload_map");
   if (j && j.ok && j.map) {
@@ -313,6 +324,36 @@ function updateNav(nav) {
                                      : (age / 60).toFixed(0) + "m")) + " ago · " +
       (tc.applied || 0) + " ok/" + (tc.rejected || 0) + " rej";
   }
+  // Second tag line: the CONDITIONING of what the camera can see, which is
+  // what now decides whether a fix is possible, plus how much corroboration a
+  // pending correction still needs. A bare "rejected" never said whether the
+  // operator should move the rover, fix the map, or simply wait.
+  (function () {
+    const g = [];
+    if (tl && tl.spread_ratio != null) {
+      g.push("baseline " + Number(tl.spread_ratio).toFixed(3) +
+             " (" + Math.round(tl.spread_mm) + "mm @ " +
+             (tl.range_mm == null ? "?" : Math.round(tl.range_mm)) + "mm)");
+    } else if (tl && tl.spread_mm != null) {
+      g.push("spread " + Math.round(tl.spread_mm) + "mm");
+    }
+    const w = nav.tag_window || {};
+    if (w.n) {
+      g.push("window " + (w.agree || 0) + "/" + w.n + " agree" +
+             (w.loose ? " (" + w.loose + " loose)" : ""));
+    }
+    if (nav.tag_pending && nav.tag_pending.why) g.push("holding: " + nav.tag_pending.why);
+    if (nav.parallax_busy) {
+      g.push("PARALLAX: jogging for a baseline\u2026");
+    } else if (nav.tag_parallax) {
+      const p = nav.tag_parallax;
+      g.push("parallax " + (p.ok ? "ok" : "failed") + " @" + p.baseline_mm + "mm" +
+             (p.ok ? "" : (p.why ? (" — " + p.why) : "")));
+    } else if (nav.degenerate_run > 0) {
+      g.push("degenerate geometry x" + nav.degenerate_run);
+    }
+    $("nav-tag-geom").textContent = g.length ? g.join(" · ") : "\u2014";
+  })();
   $("nav-accum").textContent = fmtAccum(nav.accum);
   const sEl = $("standoff-input");
   if (nav.standoff_mm != null && sEl && document.activeElement !== sEl) {
