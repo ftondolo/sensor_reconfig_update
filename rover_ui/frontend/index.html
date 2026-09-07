@@ -34,6 +34,7 @@
           <span>clearance <b id="nav-clearance">—</b></span>
           <span>drift <b id="nav-drift">—</b></span>
           <span>tags <b id="nav-tags">—</b></span>
+          <span>tag geometry <b id="nav-tag-geom">—</b></span>
           <span>accumulation <b id="nav-accum">—</b></span>
           <span>msg <b id="nav-msg-strip">—</b></span>
         </div>
@@ -102,6 +103,17 @@
         <div class="btn-row">
           <button id="btn-reload" class="btn">⟳ Reload map.json / config.json</button>
         </div>
+        <div class="btn-row">
+          <button id="btn-parallax" class="btn">⇄ Micro-parallax fix</button>
+        </div>
+        <p class="hint">
+          When the rover can only see one vertical column of tags, sideways
+          position is not measured at all and no fix is possible from that view.
+          Micro-parallax makes the missing angle instead: the rover strafes a
+          small, known distance, and the two views are fused into one solve the
+          way a stereo pair would be. It moves the rover a little sideways and
+          back, so it is refused while a navigation is running.
+        </p>
         <p class="hint">
           Place the rover physically on its start cell
           (<span id="start-cell">—</span>, facing the top of the map), then
