@@ -377,12 +377,55 @@ TAGS_AUDIT_RMS_PX = _env("TAGS_AUDIT_RMS_PX", 3.0)
 # detection it was diagnosing. The last verdict is kept and re-displayed in
 # between, so the UI still shows it continuously.
 TAGS_AUDIT_MIN_INTERVAL_S = _env("TAGS_AUDIT_MIN_INTERVAL_S", 5.0)
-# Minimum horizontal separation (mm) between the visible tags. Tags stacked in
-# one vertical column leave sideways position and heading under-determined, and
-# the solver answers with a confident mirrored pose that reprojects at ~0.3 px —
-# invisible to the RMS gate and repeatable enough to survive a confirmation run.
-# Two tags at different HEIGHTS do not substitute for two at different x.
+# Horizontal separation (mm) between the visible tags that is ALWAYS accepted,
+# at any range. Tags stacked in one vertical column leave sideways position and
+# heading under-determined, and the solver answers with a confident mirrored
+# pose that reprojects at ~0.3 px — invisible to the RMS gate and repeatable
+# enough to survive a confirmation run. Two tags at different HEIGHTS do not
+# substitute for two at different x.
+# This is no longer the whole gate: it is the unconditional PASS threshold, and
+# TAGS_MIN_SPREAD_RATIO below adds a second way in for close-range observations
+# that are well conditioned despite a narrow spread. Nothing that passed before
+# fails now.
 TAGS_MIN_SPREAD_MM = _env("TAGS_MIN_SPREAD_MM", 400.0)
+# --- angular baseline: spread / range ---------------------------------------
+# The absolute floor above rejects a genuinely good close-range observation in
+# exactly the same way as a genuinely bad far-range one, because it never asks
+# how far away the tags are. What actually governs the error is the ANGULAR
+# baseline — spread divided by range — since that is what decides how much
+# perspective difference is available to tell yaw apart from lateral
+# translation. At ratio -> 0 the view tends to orthographic, where strafing
+# sideways and rotating in yaw produce nearly the same image motion.
+# Measured (two tags, one height, 0.4 px corner noise, 200 trials, median
+# lateral pose error) — read down the RATIO column, the error tracks it and
+# barely tracks spread or range on their own:
+#     spread  range  ratio   error
+#      150 mm  0.8 m  0.188    4.5 mm
+#      250 mm  1.0 m  0.250    5.6 mm   <- rejected today for no reason
+#      250 mm  2.0 m  0.125   48.5 mm
+#      250 mm  3.5 m  0.071  287.4 mm   <- correctly bad
+#      400 mm  2.0 m  0.200   28.1 mm
+#      400 mm  3.5 m  0.114  208.0 mm   <- ACCEPTED today
+#      650 mm  2.0 m  0.325   20.3 mm   <- accepted today
+#      650 mm  3.5 m  0.186  105.8 mm   <- accepted today
+# 0.18 is calibrated against what the CURRENT gate already tolerates, not to
+# taste: a 650 mm pair at 3.5 m is ratio 0.186 with ~106 mm of error and passes
+# today, so anything at 0.18 or better is no worse conditioned than something
+# the system already trusts. Set to 0 to disable and restore the old
+# floor-only behaviour exactly.
+TAGS_MIN_SPREAD_RATIO = _env("TAGS_MIN_SPREAD_RATIO", 0.18)
+# Hard floor the ratio can never argue past: below this the two tags are
+# physically almost one tag whatever the range, and it also stops a range
+# UNDER-estimate (a partly-occluded tag measures small, so it reads as far
+# away) from talking a near-zero spread through the gate.
+TAGS_MIN_SPREAD_FLOOR_MM = _env("TAGS_MIN_SPREAD_FLOOR_MM", 150.0)
+# Make the ratio a REQUIREMENT rather than an alternative route, so a
+# wide-but-distant pair is rejected too. Note from the table above that the
+# absolute floor is the MORE permissive rule at long range — it passes a 400 mm
+# pair at 3.5 m carrying ~208 mm of error, worse than anything the ratio lets
+# through. Default False so this change only ever ADDS acceptances; turn it on
+# once you have watched the ratio reported in each fix for a session.
+TAGS_SPREAD_RATIO_STRICT = _env("TAGS_SPREAD_RATIO_STRICT", False)
 # ArUco corner refinement: NONE | SUBPIX | CONTOUR | APRILTAG. OpenCV's own
 # default is NONE, which finds a corner only to the quad detector's contour
 # vertex. SUBPIX roughly halves the corner error (0.72-0.98 px -> 0.34-0.47 px
@@ -429,6 +472,104 @@ TAGS_FIX_MAX_STEP_MM = _env("TAGS_FIX_MAX_STEP_MM", 120.0)
 # reported (state()["tag_fix"]["yaw_err_deg"]) so it can be watched before
 # being trusted.
 TAGS_CORRECT_YAW = _env("TAGS_CORRECT_YAW", False)
+
+# ---- temporal robustness: consensus instead of per-frame strictness --------
+# Every fix used to have to pass its own gates alone, so those gates had to be
+# strict enough that ONE bad frame could not do damage — which meant discarding
+# a great many good frames to catch a few bad ones. This shifts part of that
+# burden onto agreement ACROSS TIME: the per-frame thresholds get a looser
+# second tier, and a frame that only clears the loose tier can never move the
+# anchor by itself — it may only contribute to a consensus of several recent
+# observations that agree with each other. A single bad frame that slips past a
+# looser gate is then diluted by its neighbours instead of being applied, so the
+# accept rate goes up without the risk going up with it.
+# It is the same challenge-counter idea the radar ghost guard and the existing
+# TAGS_BIG_FIX_MM confirmation already use, extended to the rest of the pipeline
+# and made robust: a median with outlier trimming rather than an all-must-agree
+# veto, so one outlier among four good observations is discarded instead of
+# voiding the whole run.
+TAGS_TEMPORAL_ENABLED = _env("TAGS_TEMPORAL_ENABLED", True)
+# How long an observation stays eligible, and how many are kept. The window is
+# cleared whenever the rover moves — a measurement of where it WAS is not a
+# measurement of where it is.
+TAGS_WINDOW_S = _env("TAGS_WINDOW_S", 6.0)
+TAGS_WINDOW_N = _env("TAGS_WINDOW_N", 12)
+# Distance from the window median beyond which an observation is trimmed as an
+# outlier. Same scale as TAGS_AGREE_MM, which it generalises.
+TAGS_TRIM_MM = _env("TAGS_TRIM_MM", 150.0)
+# The loose tier, as multiples of the strict thresholds. A frame inside these
+# but outside the strict ones is consensus-only. 1.6 x 6.0 px = 9.6 px of RMS
+# and 1.5 x 12 deg = 18 deg of yaw residual: wide enough to recover the frames
+# that were being thrown away for ordinary map/detector noise, narrow enough
+# that a genuinely broken solve (the 21 deg outliers) is still refused outright.
+TAGS_LOOSE_RMS_SCALE = _env("TAGS_LOOSE_RMS_SCALE", 1.6)
+TAGS_LOOSE_YAW_SCALE = _env("TAGS_LOOSE_YAW_SCALE", 1.5)
+# How many agreeing observations a LOOSE-tier frame needs before the anchor
+# moves. Strict-tier frames keep today's behaviour: a small correction applies
+# immediately (TAGS_SMALL_FIX_CONSENSUS_N = 1) and a large one still needs
+# TAGS_CONFIRM_N, so nothing about the current accept path gets slower.
+TAGS_LOOSE_CONSENSUS_N = _env("TAGS_LOOSE_CONSENSUS_N", 3)
+TAGS_SMALL_FIX_CONSENSUS_N = _env("TAGS_SMALL_FIX_CONSENSUS_N", 1)
+
+# ---- micro-parallax: manufacture a baseline instead of waiting for one -----
+# When the rover can only see a narrow or single-column tag set, no amount of
+# gating helps: the geometry itself is unrecoverable, and the fix has to come
+# from somewhere else. It can jog a small, known lateral distance while tracking
+# the same tags and use the T265's SHORT-timescale displacement — reliable over
+# a sub-second move even though it drifts over minutes — as a synthetic second
+# viewpoint. Two views of the same tags, separated by a measured baseline, fuse
+# into one well-conditioned solve exactly the way stereo triangulation would
+# (see tag_localizer.solve_multiview for why this needs no new solver: the
+# second view's object points are simply translated back along the baseline).
+# Measured, single vertical column of two tags, 0.4 px corner noise, median
+# lateral error, one view vs the fused pair:
+#     range   baseline  pooled ratio   1 view    2 views
+#     0.8 m     200 mm     0.250        3.1 mm    1.4 mm
+#     1.2 m     200 mm     0.167       10.4 mm    4.6 mm
+#     1.6 m     300 mm     0.188       24.3 mm    8.0 mm
+#     2.0 m     300 mm     0.150       47.5 mm   15.6 mm
+#     2.5 m     300 mm     0.120      100.9 mm   30.0 mm
+# The pair beats the single view at every baseline tried, including 80 mm.
+TAGS_PARALLAX_ENABLED = _env("TAGS_PARALLAX_ENABLED", True)
+# Run it automatically when the localiser keeps reporting degenerate geometry
+# while the rover is stopped. Set False to leave it operator-triggered only
+# (POST /api/nav/parallax).
+TAGS_PARALLAX_AUTO = _env("TAGS_PARALLAX_AUTO", True)
+# How many consecutive degenerate-geometry reports trigger the auto attempt,
+# and how long to wait before trying again either way.
+TAGS_PARALLAX_TRIGGER_N = _env("TAGS_PARALLAX_TRIGGER_N", 3)
+TAGS_PARALLAX_COOLDOWN_S = _env("TAGS_PARALLAX_COOLDOWN_S", 20.0)
+# The jog is sized from the estimated range so it buys a useful angle rather
+# than a fixed number of millimetres: baseline = TARGET_RATIO * range, clamped.
+# 0.20 at 1 m is a 200 mm jog; at 3 m it saturates at the max below.
+TAGS_PARALLAX_RATIO_TARGET = _env("TAGS_PARALLAX_RATIO_TARGET", 0.20)
+TAGS_PARALLAX_BASELINE_MIN_MM = _env("TAGS_PARALLAX_BASELINE_MIN_MM", 120.0)
+TAGS_PARALLAX_BASELINE_MAX_MM = _env("TAGS_PARALLAX_BASELINE_MAX_MM", 350.0)
+# Accept gate on the FUSED pair. Lower than TAGS_MIN_SPREAD_RATIO on purpose and
+# with a reason: the same tag is seen in both views, so the pooled cloud carries
+# twice the corners (~sqrt(2) less corner noise), the baseline runs exactly
+# across the line of sight rather than partly along it as panel-mounted tags
+# usually do, and it is METRICALLY MEASURED rather than read from a map that may
+# itself be wrong. At 0.12 the measured fused error is 15-30 mm, better than the
+# ~106 mm a single view at ratio 0.186 delivers today and is trusted.
+TAGS_PARALLAX_MIN_RATIO = _env("TAGS_PARALLAX_MIN_RATIO", 0.12)
+# The pooled view must span at least this much, i.e. the rover must actually
+# have moved. Guards the case where the jog stalled against something.
+TAGS_PARALLAX_MIN_SPREAD_MM = _env("TAGS_PARALLAX_MIN_SPREAD_MM", 100.0)
+# Strafe back afterwards, so the manoeuvre leaves the rover where it found it.
+TAGS_PARALLAX_RETURN = _env("TAGS_PARALLAX_RETURN", True)
+# Settle time after each strafe before grabbing the second view: motion blur
+# ruins corner precision, which is the whole basis of the fix.
+TAGS_PARALLAX_SETTLE_S = _env("TAGS_PARALLAX_SETTLE_S", 0.5)
+# How long to wait for a FRESH detector observation at each viewpoint.
+TAGS_PARALLAX_OBS_TIMEOUT_S = _env("TAGS_PARALLAX_OBS_TIMEOUT_S", 2.5)
+# The fusion assumes the heading is the same at both viewpoints (the strafe is
+# run with hold_yaw). If the T265 says yaw moved more than this between them,
+# the assumption is broken and the pair is discarded rather than fused.
+TAGS_PARALLAX_MAX_YAW_DRIFT_DEG = _env("TAGS_PARALLAX_MAX_YAW_DRIFT_DEG", 2.0)
+# Extra clearance (mm) required beyond the normal footprint check before the
+# rover is allowed to strafe into a spot to take the second view.
+TAGS_PARALLAX_CLEARANCE_MM = _env("TAGS_PARALLAX_CLEARANCE_MM", 80.0)
 # Operator hold-to-move (jog): speed, and the dead-man window — the UI refreshes
 # the jog every ~200 ms while the button is held; if refreshes stop (release,
 # tab close, network drop) the rover stops within this many seconds.
