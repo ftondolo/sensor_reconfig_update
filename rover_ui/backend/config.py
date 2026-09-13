@@ -108,13 +108,20 @@ NAV_AUTO_COOLDOWN_S = _env("NAV_AUTO_COOLDOWN_S", 2.0)
 NAV_FOLLOW = _env("NAV_FOLLOW", False)
 NAV_FOLLOW_CYCLE_S = _env("NAV_FOLLOW_CYCLE_S", 20.0)      # stuck-backstop only
 NAV_FOLLOW_MIN_INTERVAL_S = _env("NAV_FOLLOW_MIN_INTERVAL_S", 1.0)
-NAV_FOLLOW_REPLAN_MM = _env("NAV_FOLLOW_REPLAN_MM", 300)   # re-plan when target moves this far (mm)
+NAV_FOLLOW_REPLAN_MM = _env("NAV_FOLLOW_REPLAN_MM", 500)   # re-plan when target moves this far (mm)
+# Receding-horizon refinement of the above: a target that crosses from one side
+# of the rover to the other (its map-x goes from left of the rover's current
+# position to right, or vice versa) means the leg in progress is walking
+# toward the wrong half-plane, however small the raw displacement -- so this
+# forces an early re-plan even when NAV_FOLLOW_REPLAN_MM has not been reached.
+# Guarded by a minimum lateral swing so noise near dead-centre can't flap it.
+NAV_FOLLOW_SIDE_SWITCH_MM = _env("NAV_FOLLOW_SIDE_SWITCH_MM", 300)
 # Strict move-stop-sense gate: a radar (moving-point) target is accepted only
 # after the rover has been confirmed STATIONARY this long — enough for the
 # detector to re-acquire a moving cluster while still (>= ~RADAR_ACCUM_SEC plus
 # settle). Raise if the rover commits to a radar target before it has truly
 # stopped; lower for snappier hops. (Vision targets are not gated by this.)
-NAV_FOLLOW_STILL_CONFIRM_S = _env("NAV_FOLLOW_STILL_CONFIRM_S", 1.0)
+NAV_FOLLOW_STILL_CONFIRM_S = _env("NAV_FOLLOW_STILL_CONFIRM_S", 0.5)
 # How long a projected detection target stays shown on the map after the
 # detection drops (purely cosmetic; navigation uses the live value).
 NAV_TARGET_HOLD_S = _env("NAV_TARGET_HOLD_S", 1.5)
@@ -122,7 +129,17 @@ NAV_TARGET_HOLD_S = _env("NAV_TARGET_HOLD_S", 1.5)
 # projections within this window, so a brief wrong detection (an outlier that
 # corrects itself) can't jump the target — it is out-voted by the window. Larger
 # = steadier but laggier; smaller = more responsive but jumpier.
-NAV_TARGET_WINDOW_S = _env("NAV_TARGET_WINDOW_S", 0.7)
+NAV_TARGET_WINDOW_S = _env("NAV_TARGET_WINDOW_S", 0.2)
+# The stateful target tracker (the median window above, the continuity gate,
+# and the ghost-guard confirmation run) used to be re-run independently by
+# both _monitor_loop (every 0.2 s) and _follow_loop (every 0.1 s while
+# moving), duplicating its work and padding the window with near-duplicate
+# samples. It now runs on this one dedicated cadence in a single place
+# (Navigator._track_loop); every reader (both loops, the UI) just reads the
+# cached result via project_detection(). Lower this to track faster without
+# touching the tracker's own semantics -- it does not need to match either
+# loop's polling interval.
+NAV_TRACK_UPDATE_S = _env("NAV_TRACK_UPDATE_S", 0.1)
 # Anti-teleport continuity gate (on top of the median window). Once a target is
 # locked, a projected detection that lands more than NAV_TARGET_JUMP_MM from the
 # current track is DROPPED (the track holds its place), so a spurious detection
@@ -266,7 +283,7 @@ NAV_ACCEPT_RELOC_WHEN_STILL = _env("NAV_ACCEPT_RELOC_WHEN_STILL", True)
 # confidence to reach NAV_MIN_START_CONF; if it never does, proceed anyway (so a
 # demo is never simply stuck) but scale the speed cap by NAV_LOW_CONF_SPEED_SCALE.
 NAV_MIN_START_CONF = _env("NAV_MIN_START_CONF", 2)
-NAV_CONF_WAIT_S = _env("NAV_CONF_WAIT_S", 2.0)
+NAV_CONF_WAIT_S = _env("NAV_CONF_WAIT_S", 0.5)
 NAV_LOW_CONF_SPEED_SCALE = _env("NAV_LOW_CONF_SPEED_SCALE", 0.5)
 
 # ---- drift accounting ------------------------------------------------------
@@ -282,7 +299,15 @@ NAV_DRIFT_MARGIN_MAX_MM = _env("NAV_DRIFT_MARGIN_MAX_MM", 120.0)
 # Zero-velocity drift sampling: while the rover is commanded stationary its true
 # velocity is zero, so ANY pose change the T265 reports is drift, measured
 # directly and for free. Samples are taken over this window between legs.
-NAV_ZUPT_WINDOW_S = _env("NAV_ZUPT_WINDOW_S", 0.5)
+NAV_ZUPT_WINDOW_S = _env("NAV_ZUPT_WINDOW_S", 0.1)
+# A full ZUPT sample blocks for NAV_ZUPT_WINDOW_S before the leg it precedes can
+# start, so taking one before EVERY leg adds that pause to every waypoint on a
+# multi-leg path for little extra information -- the drift rate barely moves
+# leg to leg. Skip a sample (and its wait) when the last one completed less
+# than this long ago, UNLESS T265 confidence is currently below
+# NAV_MIN_START_CONF (see _await_confidence) -- that is exactly when a fresh
+# reading is worth pausing for. 0 restores the old every-leg behaviour.
+NAV_ZUPT_MIN_INTERVAL_S = _env("NAV_ZUPT_MIN_INTERVAL_S", 2.5)
 
 # ---- sensor lever arms -----------------------------------------------------
 # A sensor mounted away from the rover's TURN CENTRE swings through an arc when
