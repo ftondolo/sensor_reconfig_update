@@ -112,6 +112,7 @@ class Navigator:
         self._drift_last_pose = None # pose sample the two above are integrated from
         self._zupt_mm_s = None       # measured drift rate while commanded stationary (mm/s)
         self._zupt_samples = 0
+        self._zupt_last_t = 0.0      # clock time of the last ZUPT sample actually taken
         self._leg_log = []           # recent [{leg, cmd_mm, got_mm, err_mm, ok, reason}]
         # The speed the OPERATOR asked for. cfg.MAX_LINEAR is also written by
         # the confidence gate (which throttles while tracking is poor), so the
@@ -179,6 +180,7 @@ class Navigator:
         self._stop = threading.Event()
         self._monitor = None
         self._follow_thread = None
+        self._track_thread = None
 
     # ------------------------------------------------------------ lifecycle
     def start(self):
@@ -188,6 +190,12 @@ class Navigator:
         self._monitor.start()
         self._follow_thread = threading.Thread(target=self._follow_loop, daemon=True)
         self._follow_thread.start()
+        # Single dedicated home for the stateful target tracker (see
+        # _track_loop / _update_target_tracking): _monitor_loop, _follow_loop
+        # and the UI all read its cached output through project_detection()
+        # instead of each re-running the tracker at their own cadence.
+        self._track_thread = threading.Thread(target=self._track_loop, daemon=True)
+        self._track_thread.start()
         return self
 
     def stop(self):
@@ -821,10 +829,27 @@ class Navigator:
         """Zero-velocity update. Called while the rover is stopped between legs:
         true velocity is zero, so any pose movement the T265 reports over the
         window is pure drift. Records it as a rate (mm/s) — the coefficient the
-        drift margin and any 'stop and re-fix' policy would key off."""
+        drift margin and any 'stop and re-fix' policy would key off.
+
+        This blocks for NAV_ZUPT_WINDOW_S, so sampling before every single leg
+        put that pause on every waypoint of a multi-leg path. The drift rate
+        does not need a fresh reading that often: skip the sample (and its
+        wait) when the last one completed less than NAV_ZUPT_MIN_INTERVAL_S
+        ago, UNLESS T265 confidence is currently below NAV_MIN_START_CONF --
+        that is exactly when a fresh reading is worth pausing for."""
         win = float(config.NAV_ZUPT_WINDOW_S)
         if win <= 0.0:
             return
+        min_interval = float(config.NAV_ZUPT_MIN_INTERVAL_S)
+        now = time.time()
+        if min_interval > 0.0:
+            with self._lock:
+                due = (now - self._zupt_last_t) >= min_interval
+            if not due:
+                pr = self.rover.get_pose()
+                conf = pr.get("confidence") if pr else None
+                if conf is None or conf >= int(config.NAV_MIN_START_CONF):
+                    return    # sampled recently enough and tracking is healthy
         a = self.pose()
         if a is None:
             return
@@ -839,6 +864,7 @@ class Navigator:
             # running mean, so one noisy sample doesn't dominate the readout
             self._zupt_mm_s = rate if prev is None else (prev * n + rate) / (n + 1)
             self._zupt_samples = n + 1
+            self._zupt_last_t = now
 
     def _await_confidence(self):
         """Hold before starting a leg until T265 tracking confidence recovers.
@@ -1007,31 +1033,70 @@ class Navigator:
             return {"x": gx, "z": gz, "adjusted": False}
         step = float(config.NAV_ADJUST_STEP_MM)
         max_d = float(config.NAV_ADJUST_MAX_MM)
-        best, best_cost = None, None
         n = int(max_d / step)
+        # Same candidate set and the same cost function as before (changing
+        # standoff is cheap, moving sideways is expensive -- see the formula
+        # below), but evaluated in ASCENDING cost order and returned on the
+        # first one that turns out to be free. _center_free() is the
+        # expensive part (it walks every obstacle) and used to be called for
+        # all ~(2n+1)^2 candidates whenever the ideal spot was blocked; now
+        # it is only called until a usable candidate is found, which for a
+        # lightly-obstructed arena is typically the first few checked.
+        # Ranking is computed for every candidate up front and _center_free()
+        # is the only thing skipped early, so the candidate this returns is
+        # IDENTICAL to the old exhaustive arg-min search -- just reached
+        # without necessarily visiting every candidate.
+        candidates = []
         for i in range(-n, n + 1):
             for j in range(-n, n + 1):
                 dx, dz = i * step, j * step
                 if dx == 0 and dz == 0:
                     continue
-                cx, cz = gx + dx, gz + dz
-                if cz < tz + smin:     # would crowd the person
+                if gz + dz < tz + smin:     # would crowd the person
                     continue
-                if not self._center_free(cx, cz):
-                    continue
-                # Soft threshold: changing the standoff is cheap (shrinking a
-                # touch dearer than growing), moving sideways is expensive.
                 cost = 3.0 * abs(dx) + (1.5 * -dz if dz < 0 else 1.0 * dz)
-                if best_cost is None or cost < best_cost:
-                    best, best_cost = (cx, cz), cost
-        if best is None:
-            return None
-        return {"x": best[0], "z": best[1], "adjusted": True}
+                candidates.append((cost, dx, dz))
+        candidates.sort(key=lambda c: c[0])   # stable: ties keep this scan's order
+        for _cost, dx, dz in candidates:
+            cx, cz = gx + dx, gz + dz
+            if self._center_free(cx, cz):
+                return {"x": cx, "z": cz, "adjusted": True}
+        return None
 
     # ------------------------------------------------------------ target projection
+    def _track_loop(self):
+        """Background home of the stateful target tracker (see
+        _update_target_tracking): runs it on ONE dedicated cadence
+        (NAV_TRACK_UPDATE_S) so the median window / continuity gate /
+        ghost-guard confirmation state is serviced exactly once per update,
+        however many places want to read the result. _monitor_loop,
+        _follow_loop and the UI (via state()) all just read the cached
+        self._target through project_detection() below instead of each
+        re-running the tracker themselves at their own cadence."""
+        interval = float(config.NAV_TRACK_UPDATE_S)
+        if interval <= 0.0:
+            interval = 0.1
+        while not self._stop.is_set():
+            try:
+                self._update_target_tracking()
+            except Exception:
+                pass
+            self._stop.wait(interval)
+
     def project_detection(self):
+        """Current tracked target (see _track_loop / _update_target_tracking):
+        a cheap read of the shared cache, NOT a re-run of the tracker. This is
+        what navigation, FOLLOW and the UI all call. Returns the target dict
+        or None."""
+        with self._lock:
+            return dict(self._target) if self._target else None
+
+    def _update_target_tracking(self):
         """Project the detector's live fused target (bearing + radar range)
-        into map mm and remember it. Returns the target dict or None."""
+        into map mm and remember it. Returns the target dict or None.
+
+        Runs on its own cadence via _track_loop -- see project_detection()
+        for the cheap accessor everything else should call instead."""
         if self._detector is None:
             return None
         tel, seq = self._detector.telemetry.get()
@@ -1301,7 +1366,15 @@ class Navigator:
                 # so its TRUE velocity is zero and any pose change the T265
                 # reports here is drift, measured directly.
                 self._zupt_sample()
-                self.apply_tag_fix()        # absolute correction while stopped
+                # Absolute (tag) correction is no longer forced HERE. It runs
+                # as its own continuous background service (_monitor_loop),
+                # applying whenever the rover happens to be stationary rather
+                # than being woven into this leg's critical path. Navigation
+                # just reads self.pose() -- above and on the next leg -- which
+                # already carries whatever the localisation service has
+                # applied so far. Same gates, same consensus/RMS/spread
+                # thresholds, same eased-in correction: only WHEN it runs has
+                # changed, never what it does or how cautious it is.
                 # Tracking-confidence gate: Low confidence is exactly when VIO
                 # drift accrues fastest. Wait briefly for it to recover; if it
                 # doesn't, still go (never strand a demo) but at reduced speed.
@@ -1523,18 +1596,29 @@ class Navigator:
         replan_mm = float(config.NAV_FOLLOW_REPLAN_MM)
         cap = float(config.NAV_FOLLOW_CYCLE_S)
         still_confirm = float(config.NAV_FOLLOW_STILL_CONFIRM_S)
+        side_switch_mm = float(config.NAV_FOLLOW_SIDE_SWITCH_MM)
         still_since = time.time()
         was_following = False
+        # Once a radar (moving-point) target has cleared the stationary-dwell
+        # check below, its lock is maintained by the detector's own tracker
+        # purely spatially through the rover's own motion (see
+        # project_detection / radar_tracker.py) -- it does not need to
+        # re-earn stillness after every stop. Reset only when the track is
+        # actually lost (a fresh acquisition, which DOES need to prove itself
+        # stationary again).
+        radar_confirmed = False
         while not self._stop.is_set():
             with self._lock:
                 follow = self._follow
             if not follow:
                 was_following = False
+                radar_confirmed = False
                 self._stop.wait(0.1)
                 continue
             if not was_following:                  # just enabled -> fresh dwell
                 was_following = True
                 still_since = time.time()
+                radar_confirmed = False
             # ---------------- SENSE PHASE (must be stationary) ----------------
             if self.rover.is_busy():
                 still_since = time.time()          # still moving -> reset the dwell
@@ -1542,18 +1626,26 @@ class Navigator:
                 continue
             t = self.project_detection()
             if t is None:
+                radar_confirmed = False   # track lost -> next lock must re-earn stillness
                 self._stop.wait(idle)
                 continue
-            # HARD INVARIANT: a radar/moving-point target is accepted ONLY once the
-            # rover has been confirmed stationary long enough to have re-acquired a
-            # moving cluster while still. Vision (RGB/thermal) is unconstrained.
-            if t.get("source") == "radar" and (time.time() - still_since) < still_confirm:
+            # HARD INVARIANT: a BRAND-NEW radar/moving-point acquisition is accepted
+            # ONLY once the rover has been confirmed stationary long enough to have
+            # re-acquired a moving cluster while still. Vision (RGB/thermal) is
+            # unconstrained. An already-confirmed radar lock is exempt: it is kept
+            # live by the detector's tracker purely spatially through the rover's
+            # own motion (no Doppler involved), the same as any other live source,
+            # so it does not need to wait out this dwell again after every stop.
+            if (t.get("source") == "radar" and not radar_confirmed
+                    and (time.time() - still_since) < still_confirm):
                 with self._lock:
                     if self._status not in ("moving", "planning"):
                         self._status = "idle"
                         self._message = "follow: confirming stationary mmWave lock…"
                 self._stop.wait(0.1)
                 continue
+            if t.get("source") == "radar":
+                radar_confirmed = True
             # ---------------- COMMIT + MOVE PHASE ----------------
             ok, _msg = self.navigate_to_target(t["x"], t["z"])
             with self._lock:
@@ -1578,13 +1670,32 @@ class Navigator:
                 # the rover's own ego-motion), so either source can trigger
                 # this re-plan.
                 nt = self.project_detection()
-                if (nt is not None
-                        and math.hypot(nt["x"] - gx, nt["z"] - gz) >= replan_mm):
-                    self.cancel()
-                    with self._lock:
-                        self._status = "moving"
-                        self._message = "follow: target moved, re-targeting"
-                    break
+                if nt is not None:
+                    moved_mm = math.hypot(nt["x"] - gx, nt["z"] - gz)
+                    # Receding-horizon rule: a leg already under way stays
+                    # alive through small target motion -- only cut it short
+                    # when the move is BIG (moved_mm >= replan_mm) or the
+                    # target crossed to the rover's other side (walked from
+                    # the left half-plane to the right, or vice versa), which
+                    # means the leg in progress now heads toward the wrong
+                    # side however small the raw distance is. The minimum-
+                    # swing guard keeps noise near dead-centre from flapping
+                    # this.
+                    p_now = self.pose()
+                    switched_side = False
+                    if p_now is not None:
+                        side_old = gx - p_now["x"]
+                        side_new = nt["x"] - p_now["x"]
+                        switched_side = (side_old * side_new < 0
+                                        and abs(side_new - side_old) >= side_switch_mm)
+                    if moved_mm >= replan_mm or switched_side:
+                        self.cancel()
+                        with self._lock:
+                            self._status = "moving"
+                            self._message = ("follow: target crossed sides, re-targeting"
+                                             if switched_side else
+                                             "follow: target moved, re-targeting")
+                        break
                 if time.time() >= deadline:
                     self.cancel()                  # stuck-backstop -> treat as done
                     with self._lock:
