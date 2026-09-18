@@ -26,7 +26,7 @@ fetch("/api/map").then((r) => r.json()).then((m) => {
   initSpeed(m);
   initJogSpeed(m);
   initStandoff(m);
-  initConfirmN(m);
+  initAvgN(m);
 });
 
 // --------------------------------------------------------- speed slider
@@ -92,19 +92,22 @@ function initStandoff(m) {
   };
 }
 
-// ------------------------------------------------ ghost-guard confirm count
-// How many consistent detector frames must accumulate before a new/moved
-// target is trusted (Navigator.project_detection). Any whole number 1-10.
-function initConfirmN(m) {
-  const el = $("confirm-n-input");
-  if (m.confirm_n != null) el.value = m.confirm_n;
+// ------------------------------------------------ target running-average window
+// How many of the most recent DETECTION FRAMES the projected target is
+// averaged over (Navigator._update_target_tracking). Frames with no detection
+// don't count. The backend clamps to [avg_n_min, avg_n_max].
+function initAvgN(m) {
+  const el = $("avg-n-input");
+  if (m.avg_n_min != null) el.min = m.avg_n_min;
+  if (m.avg_n_max != null) el.max = m.avg_n_max;
+  if (m.avg_n != null) el.value = m.avg_n;
   el.disabled = false;
-  $("confirm-n-val").textContent = el.value;
+  $("avg-n-val").textContent = el.value;
   el.onchange = async () => {
-    const j = await post("/api/nav/confirm_n", { n: parseInt(el.value, 10) });
-    if (j && j.ok && j.confirm_n != null) {
-      el.value = j.confirm_n;                     // reflect the clamped value
-      $("confirm-n-val").textContent = j.confirm_n;
+    const j = await post("/api/nav/avg_n", { n: parseInt(el.value, 10) });
+    if (j && j.ok && j.avg_n != null) {
+      el.value = j.avg_n;                         // reflect the clamped value
+      $("avg-n-val").textContent = j.avg_n;
     }
   };
 }
@@ -146,6 +149,17 @@ $("btn-home").onclick = async () => {
   if (j && j.nav) { setFollow(j.nav.follow); setAuto(j.nav.auto); }
 };
 $("btn-reset").onclick = () => post("/api/nav/reset_pose", {});
+$("btn-parallax").onclick = async () => {
+  const b = $("btn-parallax");
+  b.disabled = true;
+  b.textContent = "\u21c4 jogging for a baseline\u2026";
+  try {
+    await post("/api/nav/parallax", {});
+  } finally {
+    b.disabled = false;
+    b.textContent = "\u21c4 Micro-parallax fix";
+  }
+};
 $("btn-reload").onclick = async () => {
   const j = await post("/api/nav/reload_map");
   if (j && j.ok && j.map) {
@@ -238,6 +252,10 @@ function fmtMM(p) {
 
 function fmtAccum(a) {
   if (!a || !a.phase || a.phase === "none") return "—";
+  if (a.phase === "averaging") {
+    const sp = a.spread_mm != null ? ` · ±${a.spread_mm} mm` : "";
+    return `${a.n}/${a.need} frames${sp}`;
+  }
   if (a.phase === "accumulating") return `accumulating ${a.n}/${a.need}`;
   return "confirmed";
 }
@@ -313,6 +331,36 @@ function updateNav(nav) {
                                      : (age / 60).toFixed(0) + "m")) + " ago · " +
       (tc.applied || 0) + " ok/" + (tc.rejected || 0) + " rej";
   }
+  // Second tag line: the CONDITIONING of what the camera can see, which is
+  // what now decides whether a fix is possible, plus how much corroboration a
+  // pending correction still needs. A bare "rejected" never said whether the
+  // operator should move the rover, fix the map, or simply wait.
+  (function () {
+    const g = [];
+    if (tl && tl.spread_ratio != null) {
+      g.push("baseline " + Number(tl.spread_ratio).toFixed(3) +
+             " (" + Math.round(tl.spread_mm) + "mm @ " +
+             (tl.range_mm == null ? "?" : Math.round(tl.range_mm)) + "mm)");
+    } else if (tl && tl.spread_mm != null) {
+      g.push("spread " + Math.round(tl.spread_mm) + "mm");
+    }
+    const w = nav.tag_window || {};
+    if (w.n) {
+      g.push("window " + (w.agree || 0) + "/" + w.n + " agree" +
+             (w.loose ? " (" + w.loose + " loose)" : ""));
+    }
+    if (nav.tag_pending && nav.tag_pending.why) g.push("holding: " + nav.tag_pending.why);
+    if (nav.parallax_busy) {
+      g.push("PARALLAX: jogging for a baseline\u2026");
+    } else if (nav.tag_parallax) {
+      const p = nav.tag_parallax;
+      g.push("parallax " + (p.ok ? "ok" : "failed") + " @" + p.baseline_mm + "mm" +
+             (p.ok ? "" : (p.why ? (" — " + p.why) : "")));
+    } else if (nav.degenerate_run > 0) {
+      g.push("degenerate geometry x" + nav.degenerate_run);
+    }
+    $("nav-tag-geom").textContent = g.length ? g.join(" · ") : "\u2014";
+  })();
   $("nav-accum").textContent = fmtAccum(nav.accum);
   const sEl = $("standoff-input");
   if (nav.standoff_mm != null && sEl && document.activeElement !== sEl) {
