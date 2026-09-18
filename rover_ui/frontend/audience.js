@@ -27,6 +27,10 @@ function fmtMM(p) {
 
 function fmtAccum(a) {
   if (!a || !a.phase || a.phase === "none") return "—";
+  if (a.phase === "averaging") {
+    const sp = a.spread_mm != null ? ` · ±${a.spread_mm} mm` : "";
+    return `${a.n}/${a.need} frames${sp}`;
+  }
   if (a.phase === "accumulating") return `accumulating ${a.n}/${a.need}`;
   return "confirmed";
 }
