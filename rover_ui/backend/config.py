@@ -89,7 +89,9 @@ NAV_ADJUST_STEP_MM = _env("NAV_ADJUST_STEP_MM", 100)
 NAV_ADJUST_MAX_MM = _env("NAV_ADJUST_MAX_MM", 2500)
 # Skip a re-navigation if the new goal is within this distance of where the
 # rover already is / is already heading (don't twitch on detection jitter).
-NAV_GOAL_TOLERANCE_MM = _env("NAV_GOAL_TOLERANCE_MM", 250)
+# Raised 250 -> 350 (2026-09-18): re-dispatching for a goal only ~250 mm away
+# re-planned on target jitter and made the rover shuttle back and forth.
+NAV_GOAL_TOLERANCE_MM = _env("NAV_GOAL_TOLERANCE_MM", 350)
 # AUTO mode: re-navigate whenever a (stable) detection target appears. The
 # target's projected map position must hold within NAV_AUTO_STABLE_MM for
 # NAV_AUTO_STABLE_S seconds before a move is dispatched.
@@ -108,41 +110,56 @@ NAV_AUTO_COOLDOWN_S = _env("NAV_AUTO_COOLDOWN_S", 2.0)
 NAV_FOLLOW = _env("NAV_FOLLOW", False)
 NAV_FOLLOW_CYCLE_S = _env("NAV_FOLLOW_CYCLE_S", 20.0)      # stuck-backstop only
 NAV_FOLLOW_MIN_INTERVAL_S = _env("NAV_FOLLOW_MIN_INTERVAL_S", 1.0)
-NAV_FOLLOW_REPLAN_MM = _env("NAV_FOLLOW_REPLAN_MM", 300)   # re-plan when target moves this far (mm)
+NAV_FOLLOW_REPLAN_MM = _env("NAV_FOLLOW_REPLAN_MM", 500)   # re-plan when target moves this far (mm)
+# Receding-horizon refinement of the above: a target that crosses from one side
+# of the rover to the other (its map-x goes from left of the rover's current
+# position to right, or vice versa) means the leg in progress is walking
+# toward the wrong half-plane, however small the raw displacement -- so this
+# forces an early re-plan even when NAV_FOLLOW_REPLAN_MM has not been reached.
+# Guarded by a minimum lateral swing so noise near dead-centre can't flap it.
+NAV_FOLLOW_SIDE_SWITCH_MM = _env("NAV_FOLLOW_SIDE_SWITCH_MM", 300)
 # Strict move-stop-sense gate: a radar (moving-point) target is accepted only
 # after the rover has been confirmed STATIONARY this long — enough for the
 # detector to re-acquire a moving cluster while still (>= ~RADAR_ACCUM_SEC plus
 # settle). Raise if the rover commits to a radar target before it has truly
 # stopped; lower for snappier hops. (Vision targets are not gated by this.)
-NAV_FOLLOW_STILL_CONFIRM_S = _env("NAV_FOLLOW_STILL_CONFIRM_S", 1.0)
+NAV_FOLLOW_STILL_CONFIRM_S = _env("NAV_FOLLOW_STILL_CONFIRM_S", 0.5)
 # How long a projected detection target stays shown on the map after the
 # detection drops (purely cosmetic; navigation uses the live value).
 NAV_TARGET_HOLD_S = _env("NAV_TARGET_HOLD_S", 1.5)
-# Anti-jump window: the projected map target is the MEDIAN of all raw
-# projections within this window, so a brief wrong detection (an outlier that
-# corrects itself) can't jump the target — it is out-voted by the window. Larger
-# = steadier but laggier; smaller = more responsive but jumpier.
-NAV_TARGET_WINDOW_S = _env("NAV_TARGET_WINDOW_S", 0.7)
-# Anti-teleport continuity gate (on top of the median window). Once a target is
-# locked, a projected detection that lands more than NAV_TARGET_JUMP_MM from the
-# current track is DROPPED (the track holds its place), so a spurious detection
-# or a target lost-and-refound elsewhere cannot teleport the marker. A far
-# detection only re-locks after it persists NAV_TARGET_RELOCK_S (the person
-# really walked there), or after the track goes stale with no accepted update for
-# NAV_TARGET_FORGET_S (a long loss -> allow a fresh lock anywhere).
+# ---- target running average (replaces the Confirm-N ghost guard) ----------
+# The projected map target is a ROBUST RUNNING AVERAGE over the last
+# NAV_TARGET_AVG_N DETECTION FRAMES -- only detector frames that carry a FRESH
+# detection count (see detector.py target["fresh"]); frames with no detection,
+# or where the detector is merely coasting/holding an old box or radar lock,
+# do not advance the window. The window always ends at the current detection
+# frame and uses however many frames exist (1..N), so it never waits to fill.
+#
+# Ghost handling is by WEIGHTING, not by a hard block: the centre is the medoid
+# of the window (the sample closest to all others; ties -> newest), samples
+# within NAV_TARGET_INLIER_MM of it count fully, the weight tapers to zero at
+# NAV_TARGET_JUMP_MM. A one-frame ghost therefore has no effect; a real move is
+# followed once it holds the majority of the window (~N/2+1 detection frames).
+# Operator-settable at runtime via the UI (Navigator.set_avg_n), clamped to
+# [NAV_TARGET_AVG_N_MIN, NAV_TARGET_AVG_N_MAX]. Below 3 there is little ghost
+# rejection left.
+NAV_TARGET_AVG_N = _env("NAV_TARGET_AVG_N", 5)
+NAV_TARGET_AVG_N_MIN = _env("NAV_TARGET_AVG_N_MIN", 1)
+NAV_TARGET_AVG_N_MAX = _env("NAV_TARGET_AVG_N_MAX", 20)
+NAV_TARGET_INLIER_MM = _env("NAV_TARGET_INLIER_MM", 250)
+# Beyond this distance from the window centre a sample gets zero weight.
 NAV_TARGET_JUMP_MM = _env("NAV_TARGET_JUMP_MM", 700)
-NAV_TARGET_RELOCK_S = _env("NAV_TARGET_RELOCK_S", 2.5)
+# Detection frames only advance the window when they arrive, so after a long
+# loss the window could hold a position the person has long left. If the newest
+# sample is older than this, the window is cleared and the next detection
+# starts a fresh lock.
 NAV_TARGET_FORGET_S = _env("NAV_TARGET_FORGET_S", 5.0)
-# Ghost guard (navigator.project_detection): how many DISTINCT, mutually
-# consistent detector frames must accumulate before a new or relocated target
-# is committed. 1 restores the old single-frame behaviour. Operator-settable
-# at runtime via Navigator.set_confirm_n(), which clamps to [1, 10].
-NAV_TARGET_CONFIRM_N = _env("NAV_TARGET_CONFIRM_N", 3)
-# Companion to the above, for mmWave targets only: two reflected-intensity
-# (SNR) readings count as "the same reflector" when they differ by no more than
-# this FRACTION of the larger one. Loose on purpose — real returns fluctuate
-# frame to frame, and a vision target has no SNR at all (comparison is skipped).
-NAV_TARGET_SNR_TOL = _env("NAV_TARGET_SNR_TOL", 0.5)
+# How often the tracker polls the detector for a new frame (Navigator._track_loop).
+# Faster than the detector frame rate so no detection frame is missed; repeated
+# polls of the same frame are ignored.
+NAV_TRACK_UPDATE_S = _env("NAV_TRACK_UPDATE_S", 0.05)
+# Removed 2026-09-18 with the running average: NAV_TARGET_WINDOW_S (median
+# window), NAV_TARGET_RELOCK_S, NAV_TARGET_CONFIRM_N, NAV_TARGET_SNR_TOL.
 # Emergency stop: while moving, if the rover footprint (car half-extent + this
 # margin) overlaps a RAW obstacle, cancel the move and stop immediately.
 #
@@ -197,7 +214,11 @@ NAV_RAMP_STEP = _env("NAV_RAMP_STEP", 0.05)
 # Lowered 0.12 -> 0.06 to suit the tighter POS_TOL; the stiction integral below
 # (LIN_IGAIN/LIN_I_MAX) restores breakaway authority on demand, which is what
 # the old high floor was crudely providing all the time.
-NAV_MIN_LINEAR = _env("NAV_MIN_LINEAR", 0.06)
+# Lowered 0.06 -> 0.045 (2026-09-18): a slower final approach keeps the
+# stopping distance well inside POS_TOL. Must stay ABOVE the speed at which the
+# base actually breaks away from rest -- if legs now stall short of the goal,
+# raise this back toward 0.06.
+NAV_MIN_LINEAR = _env("NAV_MIN_LINEAR", 0.045)
 # Operator-settable speed range for the UI slider (clamps POST /api/nav/speed).
 NAV_SPEED_MIN = _env("NAV_SPEED_MIN", 0.05)     # m/s slowest selectable
 NAV_SPEED_MAX = _env("NAV_SPEED_MAX", 0.80)     # m/s fastest selectable
@@ -214,7 +235,10 @@ NAV_POS_TOL = _env("NAV_POS_TOL", 0.025)
 # count against this budget. The watchdog now skips ticks where position is
 # already inside tolerance (see T265RoverService._tick), and this margin is the
 # second line of defence.
-NAV_STALL_TIMEOUT_S = _env("NAV_STALL_TIMEOUT_S", 8.0)
+# Lowered 8.0 -> 4.0 (2026-09-18): end-of-leg hunting never improves the best
+# distance, so this is how long any residual hunting can run before the leg is
+# failed as "stalled" and FOLLOW/AUTO re-plans from the live pose.
+NAV_STALL_TIMEOUT_S = _env("NAV_STALL_TIMEOUT_S", 4.0)
 # Heading deadband (rad). MUST be >= the arrival tolerance YAW_TOL (0.020 rad):
 # a controller that keeps correcting inside the band it is judged "arrived" in
 # will hunt. Inside the deadband the yaw command is zeroed and the integral is
@@ -244,9 +268,17 @@ NAV_MOVE_TIMEOUT_BASE_S = _env("NAV_MOVE_TIMEOUT_BASE_S", 9.0)
 # overshoots); it integrates TIME SPENT STUCK — accruing only while the rover is
 # commanded to move but is closing on the goal slower than LIN_STICTION_EPS, and
 # bleeding off again as soon as it moves properly. Mirrors YAW_IGAIN/YAW_I_MAX.
-NAV_LIN_IGAIN = _env("NAV_LIN_IGAIN", 0.6)          # m/s of boost per second stuck
-NAV_LIN_I_MAX = _env("NAV_LIN_I_MAX", 0.10)         # m/s cap on that boost (anti-windup)
-NAV_LIN_STICTION_EPS = _env("NAV_LIN_STICTION_EPS", 0.02)   # m/s: "not really moving"
+#
+# Softened 2026-09-18 (was IGAIN 0.6 / I_MAX 0.10 / EPS 0.02) -- this was the main
+# driver of the end-of-move hunting: an OVERSHOOT also reads as "not closing",
+# so the boost wound up on every overshoot and sent the rover back through the
+# tolerance ball at ~0.15 m/s, overshooting further each time. (It also jumps
+# straight to I_MAX on leaving the ball, because prev_dist/prev_t are not
+# updated while inside it.) Smaller gain + cap keep breakaway help but bound
+# the return speed to ~MIN_LINEAR + 0.04. A/B with IGAIN = 0 to disable it.
+NAV_LIN_IGAIN = _env("NAV_LIN_IGAIN", 0.2)          # m/s of boost per second stuck
+NAV_LIN_I_MAX = _env("NAV_LIN_I_MAX", 0.04)         # m/s cap on that boost (anti-windup)
+NAV_LIN_STICTION_EPS = _env("NAV_LIN_STICTION_EPS", 0.01)   # m/s: "not really moving"
 
 # ---- T265 relocalisation ---------------------------------------------------
 # The T265 maps its surroundings continuously and relocalises against that map
@@ -266,7 +298,7 @@ NAV_ACCEPT_RELOC_WHEN_STILL = _env("NAV_ACCEPT_RELOC_WHEN_STILL", True)
 # confidence to reach NAV_MIN_START_CONF; if it never does, proceed anyway (so a
 # demo is never simply stuck) but scale the speed cap by NAV_LOW_CONF_SPEED_SCALE.
 NAV_MIN_START_CONF = _env("NAV_MIN_START_CONF", 2)
-NAV_CONF_WAIT_S = _env("NAV_CONF_WAIT_S", 2.0)
+NAV_CONF_WAIT_S = _env("NAV_CONF_WAIT_S", 0.5)
 NAV_LOW_CONF_SPEED_SCALE = _env("NAV_LOW_CONF_SPEED_SCALE", 0.5)
 
 # ---- drift accounting ------------------------------------------------------
@@ -282,7 +314,15 @@ NAV_DRIFT_MARGIN_MAX_MM = _env("NAV_DRIFT_MARGIN_MAX_MM", 120.0)
 # Zero-velocity drift sampling: while the rover is commanded stationary its true
 # velocity is zero, so ANY pose change the T265 reports is drift, measured
 # directly and for free. Samples are taken over this window between legs.
-NAV_ZUPT_WINDOW_S = _env("NAV_ZUPT_WINDOW_S", 0.5)
+NAV_ZUPT_WINDOW_S = _env("NAV_ZUPT_WINDOW_S", 0.1)
+# A full ZUPT sample blocks for NAV_ZUPT_WINDOW_S before the leg it precedes can
+# start, so taking one before EVERY leg adds that pause to every waypoint on a
+# multi-leg path for little extra information -- the drift rate barely moves
+# leg to leg. Skip a sample (and its wait) when the last one completed less
+# than this long ago, UNLESS T265 confidence is currently below
+# NAV_MIN_START_CONF (see _await_confidence) -- that is exactly when a fresh
+# reading is worth pausing for. 0 restores the old every-leg behaviour.
+NAV_ZUPT_MIN_INTERVAL_S = _env("NAV_ZUPT_MIN_INTERVAL_S", 2.5)
 
 # ---- sensor lever arms -----------------------------------------------------
 # A sensor mounted away from the rover's TURN CENTRE swings through an arc when
@@ -377,12 +417,55 @@ TAGS_AUDIT_RMS_PX = _env("TAGS_AUDIT_RMS_PX", 3.0)
 # detection it was diagnosing. The last verdict is kept and re-displayed in
 # between, so the UI still shows it continuously.
 TAGS_AUDIT_MIN_INTERVAL_S = _env("TAGS_AUDIT_MIN_INTERVAL_S", 5.0)
-# Minimum horizontal separation (mm) between the visible tags. Tags stacked in
-# one vertical column leave sideways position and heading under-determined, and
-# the solver answers with a confident mirrored pose that reprojects at ~0.3 px —
-# invisible to the RMS gate and repeatable enough to survive a confirmation run.
-# Two tags at different HEIGHTS do not substitute for two at different x.
+# Horizontal separation (mm) between the visible tags that is ALWAYS accepted,
+# at any range. Tags stacked in one vertical column leave sideways position and
+# heading under-determined, and the solver answers with a confident mirrored
+# pose that reprojects at ~0.3 px — invisible to the RMS gate and repeatable
+# enough to survive a confirmation run. Two tags at different HEIGHTS do not
+# substitute for two at different x.
+# This is no longer the whole gate: it is the unconditional PASS threshold, and
+# TAGS_MIN_SPREAD_RATIO below adds a second way in for close-range observations
+# that are well conditioned despite a narrow spread. Nothing that passed before
+# fails now.
 TAGS_MIN_SPREAD_MM = _env("TAGS_MIN_SPREAD_MM", 400.0)
+# --- angular baseline: spread / range ---------------------------------------
+# The absolute floor above rejects a genuinely good close-range observation in
+# exactly the same way as a genuinely bad far-range one, because it never asks
+# how far away the tags are. What actually governs the error is the ANGULAR
+# baseline — spread divided by range — since that is what decides how much
+# perspective difference is available to tell yaw apart from lateral
+# translation. At ratio -> 0 the view tends to orthographic, where strafing
+# sideways and rotating in yaw produce nearly the same image motion.
+# Measured (two tags, one height, 0.4 px corner noise, 200 trials, median
+# lateral pose error) — read down the RATIO column, the error tracks it and
+# barely tracks spread or range on their own:
+#     spread  range  ratio   error
+#      150 mm  0.8 m  0.188    4.5 mm
+#      250 mm  1.0 m  0.250    5.6 mm   <- rejected today for no reason
+#      250 mm  2.0 m  0.125   48.5 mm
+#      250 mm  3.5 m  0.071  287.4 mm   <- correctly bad
+#      400 mm  2.0 m  0.200   28.1 mm
+#      400 mm  3.5 m  0.114  208.0 mm   <- ACCEPTED today
+#      650 mm  2.0 m  0.325   20.3 mm   <- accepted today
+#      650 mm  3.5 m  0.186  105.8 mm   <- accepted today
+# 0.18 is calibrated against what the CURRENT gate already tolerates, not to
+# taste: a 650 mm pair at 3.5 m is ratio 0.186 with ~106 mm of error and passes
+# today, so anything at 0.18 or better is no worse conditioned than something
+# the system already trusts. Set to 0 to disable and restore the old
+# floor-only behaviour exactly.
+TAGS_MIN_SPREAD_RATIO = _env("TAGS_MIN_SPREAD_RATIO", 0.18)
+# Hard floor the ratio can never argue past: below this the two tags are
+# physically almost one tag whatever the range, and it also stops a range
+# UNDER-estimate (a partly-occluded tag measures small, so it reads as far
+# away) from talking a near-zero spread through the gate.
+TAGS_MIN_SPREAD_FLOOR_MM = _env("TAGS_MIN_SPREAD_FLOOR_MM", 150.0)
+# Make the ratio a REQUIREMENT rather than an alternative route, so a
+# wide-but-distant pair is rejected too. Note from the table above that the
+# absolute floor is the MORE permissive rule at long range — it passes a 400 mm
+# pair at 3.5 m carrying ~208 mm of error, worse than anything the ratio lets
+# through. Default False so this change only ever ADDS acceptances; turn it on
+# once you have watched the ratio reported in each fix for a session.
+TAGS_SPREAD_RATIO_STRICT = _env("TAGS_SPREAD_RATIO_STRICT", False)
 # ArUco corner refinement: NONE | SUBPIX | CONTOUR | APRILTAG. OpenCV's own
 # default is NONE, which finds a corner only to the quad detector's contour
 # vertex. SUBPIX roughly halves the corner error (0.72-0.98 px -> 0.34-0.47 px
@@ -429,6 +512,104 @@ TAGS_FIX_MAX_STEP_MM = _env("TAGS_FIX_MAX_STEP_MM", 120.0)
 # reported (state()["tag_fix"]["yaw_err_deg"]) so it can be watched before
 # being trusted.
 TAGS_CORRECT_YAW = _env("TAGS_CORRECT_YAW", False)
+
+# ---- temporal robustness: consensus instead of per-frame strictness --------
+# Every fix used to have to pass its own gates alone, so those gates had to be
+# strict enough that ONE bad frame could not do damage — which meant discarding
+# a great many good frames to catch a few bad ones. This shifts part of that
+# burden onto agreement ACROSS TIME: the per-frame thresholds get a looser
+# second tier, and a frame that only clears the loose tier can never move the
+# anchor by itself — it may only contribute to a consensus of several recent
+# observations that agree with each other. A single bad frame that slips past a
+# looser gate is then diluted by its neighbours instead of being applied, so the
+# accept rate goes up without the risk going up with it.
+# It is the same challenge-counter idea the radar ghost guard and the existing
+# TAGS_BIG_FIX_MM confirmation already use, extended to the rest of the pipeline
+# and made robust: a median with outlier trimming rather than an all-must-agree
+# veto, so one outlier among four good observations is discarded instead of
+# voiding the whole run.
+TAGS_TEMPORAL_ENABLED = _env("TAGS_TEMPORAL_ENABLED", True)
+# How long an observation stays eligible, and how many are kept. The window is
+# cleared whenever the rover moves — a measurement of where it WAS is not a
+# measurement of where it is.
+TAGS_WINDOW_S = _env("TAGS_WINDOW_S", 6.0)
+TAGS_WINDOW_N = _env("TAGS_WINDOW_N", 12)
+# Distance from the window median beyond which an observation is trimmed as an
+# outlier. Same scale as TAGS_AGREE_MM, which it generalises.
+TAGS_TRIM_MM = _env("TAGS_TRIM_MM", 150.0)
+# The loose tier, as multiples of the strict thresholds. A frame inside these
+# but outside the strict ones is consensus-only. 1.6 x 6.0 px = 9.6 px of RMS
+# and 1.5 x 12 deg = 18 deg of yaw residual: wide enough to recover the frames
+# that were being thrown away for ordinary map/detector noise, narrow enough
+# that a genuinely broken solve (the 21 deg outliers) is still refused outright.
+TAGS_LOOSE_RMS_SCALE = _env("TAGS_LOOSE_RMS_SCALE", 1.6)
+TAGS_LOOSE_YAW_SCALE = _env("TAGS_LOOSE_YAW_SCALE", 1.5)
+# How many agreeing observations a LOOSE-tier frame needs before the anchor
+# moves. Strict-tier frames keep today's behaviour: a small correction applies
+# immediately (TAGS_SMALL_FIX_CONSENSUS_N = 1) and a large one still needs
+# TAGS_CONFIRM_N, so nothing about the current accept path gets slower.
+TAGS_LOOSE_CONSENSUS_N = _env("TAGS_LOOSE_CONSENSUS_N", 3)
+TAGS_SMALL_FIX_CONSENSUS_N = _env("TAGS_SMALL_FIX_CONSENSUS_N", 1)
+
+# ---- micro-parallax: manufacture a baseline instead of waiting for one -----
+# When the rover can only see a narrow or single-column tag set, no amount of
+# gating helps: the geometry itself is unrecoverable, and the fix has to come
+# from somewhere else. It can jog a small, known lateral distance while tracking
+# the same tags and use the T265's SHORT-timescale displacement — reliable over
+# a sub-second move even though it drifts over minutes — as a synthetic second
+# viewpoint. Two views of the same tags, separated by a measured baseline, fuse
+# into one well-conditioned solve exactly the way stereo triangulation would
+# (see tag_localizer.solve_multiview for why this needs no new solver: the
+# second view's object points are simply translated back along the baseline).
+# Measured, single vertical column of two tags, 0.4 px corner noise, median
+# lateral error, one view vs the fused pair:
+#     range   baseline  pooled ratio   1 view    2 views
+#     0.8 m     200 mm     0.250        3.1 mm    1.4 mm
+#     1.2 m     200 mm     0.167       10.4 mm    4.6 mm
+#     1.6 m     300 mm     0.188       24.3 mm    8.0 mm
+#     2.0 m     300 mm     0.150       47.5 mm   15.6 mm
+#     2.5 m     300 mm     0.120      100.9 mm   30.0 mm
+# The pair beats the single view at every baseline tried, including 80 mm.
+TAGS_PARALLAX_ENABLED = _env("TAGS_PARALLAX_ENABLED", True)
+# Run it automatically when the localiser keeps reporting degenerate geometry
+# while the rover is stopped. Set False to leave it operator-triggered only
+# (POST /api/nav/parallax).
+TAGS_PARALLAX_AUTO = _env("TAGS_PARALLAX_AUTO", True)
+# How many consecutive degenerate-geometry reports trigger the auto attempt,
+# and how long to wait before trying again either way.
+TAGS_PARALLAX_TRIGGER_N = _env("TAGS_PARALLAX_TRIGGER_N", 3)
+TAGS_PARALLAX_COOLDOWN_S = _env("TAGS_PARALLAX_COOLDOWN_S", 20.0)
+# The jog is sized from the estimated range so it buys a useful angle rather
+# than a fixed number of millimetres: baseline = TARGET_RATIO * range, clamped.
+# 0.20 at 1 m is a 200 mm jog; at 3 m it saturates at the max below.
+TAGS_PARALLAX_RATIO_TARGET = _env("TAGS_PARALLAX_RATIO_TARGET", 0.20)
+TAGS_PARALLAX_BASELINE_MIN_MM = _env("TAGS_PARALLAX_BASELINE_MIN_MM", 120.0)
+TAGS_PARALLAX_BASELINE_MAX_MM = _env("TAGS_PARALLAX_BASELINE_MAX_MM", 350.0)
+# Accept gate on the FUSED pair. Lower than TAGS_MIN_SPREAD_RATIO on purpose and
+# with a reason: the same tag is seen in both views, so the pooled cloud carries
+# twice the corners (~sqrt(2) less corner noise), the baseline runs exactly
+# across the line of sight rather than partly along it as panel-mounted tags
+# usually do, and it is METRICALLY MEASURED rather than read from a map that may
+# itself be wrong. At 0.12 the measured fused error is 15-30 mm, better than the
+# ~106 mm a single view at ratio 0.186 delivers today and is trusted.
+TAGS_PARALLAX_MIN_RATIO = _env("TAGS_PARALLAX_MIN_RATIO", 0.12)
+# The pooled view must span at least this much, i.e. the rover must actually
+# have moved. Guards the case where the jog stalled against something.
+TAGS_PARALLAX_MIN_SPREAD_MM = _env("TAGS_PARALLAX_MIN_SPREAD_MM", 100.0)
+# Strafe back afterwards, so the manoeuvre leaves the rover where it found it.
+TAGS_PARALLAX_RETURN = _env("TAGS_PARALLAX_RETURN", True)
+# Settle time after each strafe before grabbing the second view: motion blur
+# ruins corner precision, which is the whole basis of the fix.
+TAGS_PARALLAX_SETTLE_S = _env("TAGS_PARALLAX_SETTLE_S", 0.5)
+# How long to wait for a FRESH detector observation at each viewpoint.
+TAGS_PARALLAX_OBS_TIMEOUT_S = _env("TAGS_PARALLAX_OBS_TIMEOUT_S", 2.5)
+# The fusion assumes the heading is the same at both viewpoints (the strafe is
+# run with hold_yaw). If the T265 says yaw moved more than this between them,
+# the assumption is broken and the pair is discarded rather than fused.
+TAGS_PARALLAX_MAX_YAW_DRIFT_DEG = _env("TAGS_PARALLAX_MAX_YAW_DRIFT_DEG", 2.0)
+# Extra clearance (mm) required beyond the normal footprint check before the
+# rover is allowed to strafe into a spot to take the second view.
+TAGS_PARALLAX_CLEARANCE_MM = _env("TAGS_PARALLAX_CLEARANCE_MM", 80.0)
 # Operator hold-to-move (jog): speed, and the dead-man window — the UI refreshes
 # the jog every ~200 ms while the button is held; if refreshes stop (release,
 # tab close, network drop) the rover stops within this many seconds.
