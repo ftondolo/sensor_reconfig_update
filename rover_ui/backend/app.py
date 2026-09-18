@@ -28,7 +28,7 @@ Endpoints:
                                     overlaps an obstacle/clearance zone (start/continue)
   POST /api/nav/speed          -> {mps} set the navigation speed cap (clamped)
   POST /api/nav/jog_speed      -> {mps} set the Drive-pad hold-to-move speed
-  POST /api/nav/confirm_n      -> {n} set the ghost-guard confirm-count (1-10, clamped)
+  POST /api/nav/avg_n          -> {n} set the target running-average window, in detection frames (clamped)
   POST /api/nav/standoff       -> {mm} set the target approach distance (clamped)
   POST /api/nav/reset_pose     -> {x?, z?} anchor the current pose to a map cell
   POST /api/nav/nudge          -> {axis, mm} small open-map setup move
@@ -240,7 +240,7 @@ class StandoffBody(BaseModel):
     mm: float
 
 
-class ConfirmNBody(BaseModel):
+class AvgNBody(BaseModel):
     n: int
 
 
@@ -262,6 +262,13 @@ class NudgeBody(BaseModel):
 class JogBody(BaseModel):
     x: int = 0    # -1 = left, +1 = right
     z: int = 0    # -1 = forward, +1 = back
+
+
+class ParallaxBody(BaseModel):
+    # Both optional: left unset, the jog is sized from the estimated range and
+    # the direction is whichever side has clear floor.
+    baseline_mm: Optional[float] = None
+    direction: Optional[str] = None      # "left" | "right"
 
 
 @app.post("/api/nav/go")
@@ -332,14 +339,15 @@ def nav_jog_speed(body: JogSpeedBody):
     return {"ok": True, "jog_speed": applied}
 
 
-@app.post("/api/nav/confirm_n")
-def nav_confirm_n(body: ConfirmNBody):
-    """Set how many mutually-consistent detector frames (1-10, clamped) must
-    accumulate before a new/relocated detection target is trusted (the
-    ghost-detection guard in Navigator.project_detection). Takes effect on
-    the very next detection, no restart needed."""
-    applied = nav.set_confirm_n(body.n)
-    return {"ok": True, "confirm_n": applied, "nav": nav.state()}
+@app.post("/api/nav/avg_n")
+def nav_avg_n(body: AvgNBody):
+    """Set the target running-average window: how many of the most recent
+    DETECTION FRAMES (frames that actually contain a detection) the projected
+    target averages over (Navigator._update_target_tracking). Clamped to
+    [NAV_TARGET_AVG_N_MIN, NAV_TARGET_AVG_N_MAX]. Takes effect on the next
+    detection frame, no restart needed."""
+    applied = nav.set_avg_n(body.n)
+    return {"ok": True, "avg_n": applied, "nav": nav.state()}
 
 
 @app.post("/api/nav/standoff")
@@ -398,6 +406,31 @@ def nav_jog(body: JogBody):
 def nav_jog_stop():
     nav.jog_stop()
     return {"ok": True}
+
+
+@app.post("/api/nav/parallax")
+def nav_parallax(body: ParallaxBody = ParallaxBody()):
+    """Take a micro-parallax fix: jog sideways a known distance and fuse the two
+    views into one well-conditioned solve.
+
+    This is the rescue for a view that is degenerate by GEOMETRY — a single
+    vertical column of tags carries no sideways information, and no gate can
+    recover what was never measured. The rover manufactures the missing baseline
+    instead of waiting for a better view to come along. It moves the rover
+    (~120-350 mm sideways and, by default, back again), so it is refused while a
+    navigation is running.
+    """
+    if body.direction not in (None, "left", "right"):
+        return JSONResponse({"ok": False, "error": "direction must be 'left' or 'right'"},
+                            status_code=422)
+    if body.baseline_mm is not None and not (20.0 <= abs(body.baseline_mm) <= 600.0):
+        return JSONResponse({"ok": False, "error": "baseline_mm must be 20..600"},
+                            status_code=422)
+    ok, msg, detail = nav.parallax_fix(baseline_mm=body.baseline_mm,
+                                       direction=body.direction)
+    code = 200 if ok else 409
+    return JSONResponse({"ok": ok, "message": msg, "parallax": detail,
+                         "nav": nav.state()}, status_code=code)
 
 
 @app.post("/api/nav/nudge")
