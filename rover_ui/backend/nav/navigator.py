@@ -25,6 +25,7 @@ Owns the movement logic of the demo:
 The T265 has exactly one owner in this process: the T265RoverService here.
 (Do not start a second T265 pose sensor thread alongside this.)
 """
+import collections
 import json
 import math
 import os
@@ -33,6 +34,7 @@ import threading
 import time
 
 from .. import config
+from . import tag_fusion
 
 # Repo root holds rectilinear_mm.py and the purely_control package.
 if config.DEMO_ROOT not in sys.path:
@@ -52,6 +54,56 @@ def _wrap_deg(d):
     the rover has turned, so a heading crossing +/-180 doesn't count as ~360."""
     return math.degrees(math.atan2(math.sin(math.radians(d)),
                                    math.cos(math.radians(d))))
+
+
+def _robust_average(samples, inlier_mm, jump_mm):
+    """Robust weighted mean of map samples [{x, z, snr, t}, ...] (oldest first).
+
+    Centre = medoid: the SAMPLE with the smallest summed distance to all the
+    others (always a real observation, never a midpoint between two clusters);
+    ties go to the newest sample. Each sample is then weighted by its distance
+    d from that centre: 1 within inlier_mm, tapering smoothly to 0 at jump_mm
+    (a Huber-style taper), so a one-frame ghost contributes nothing while the
+    genuine cluster is averaged. Radar samples whose reflection strength is far
+    from the window's typical value are down-weighted (soft, never to zero).
+    Returns {x, z, spread (weighted RMS distance to the mean, mm), inliers}."""
+    n = len(samples)
+    if n == 1:
+        s0 = samples[0]
+        return {"x": s0["x"], "z": s0["z"], "spread": 0.0, "inliers": 1}
+    best_i, best_cost = n - 1, None
+    for i in range(n - 1, -1, -1):          # newest first -> newest wins ties
+        si = samples[i]
+        cost = sum(math.hypot(si["x"] - q["x"], si["z"] - q["z"]) for q in samples)
+        if best_cost is None or cost < best_cost - 1e-6:
+            best_i, best_cost = i, cost
+    cx, cz = samples[best_i]["x"], samples[best_i]["z"]
+    snrs = [q["snr"] for q in samples if q.get("snr") is not None]
+    sref = _median(snrs) if snrs else None
+    inlier_mm = max(1.0, inlier_mm)
+    jump_mm = max(inlier_mm + 1.0, jump_mm)
+    ws, xs, zs = [], [], []
+    for q in samples:
+        d = math.hypot(q["x"] - cx, q["z"] - cz)
+        if d <= inlier_mm:
+            w = 1.0
+        elif d >= jump_mm:
+            w = 0.0
+        else:
+            w = (inlier_mm / d) * (jump_mm - d) / (jump_mm - inlier_mm)
+        if w > 0.0 and sref is not None and q.get("snr") is not None:
+            rel = abs(q["snr"] - sref) / max(q["snr"], sref, 1e-6)
+            w *= max(0.25, 1.0 - rel)
+        ws.append(w); xs.append(q["x"]); zs.append(q["z"])
+    wsum = sum(ws)
+    if wsum <= 1e-9:                         # cannot happen (centre has w=1), but be safe
+        return {"x": cx, "z": cz, "spread": 0.0, "inliers": 1}
+    mx = sum(w * x for w, x in zip(ws, xs)) / wsum
+    mz = sum(w * z for w, z in zip(ws, zs)) / wsum
+    spread = math.sqrt(sum(w * ((x - mx) ** 2 + (z - mz) ** 2)
+                           for w, x, z in zip(ws, xs, zs)) / wsum)
+    return {"x": mx, "z": mz, "spread": spread,
+            "inliers": sum(1 for w in ws if w >= 0.5)}
 
 
 def _median(vals):
@@ -111,6 +163,7 @@ class Navigator:
         self._drift_last_pose = None # pose sample the two above are integrated from
         self._zupt_mm_s = None       # measured drift rate while commanded stationary (mm/s)
         self._zupt_samples = 0
+        self._zupt_last_t = 0.0      # clock time of the last ZUPT sample actually taken
         self._leg_log = []           # recent [{leg, cmd_mm, got_mm, err_mm, ok, reason}]
         # The speed the OPERATOR asked for. cfg.MAX_LINEAR is also written by
         # the confidence gate (which throttles while tracking is poor), so the
@@ -132,18 +185,30 @@ class Navigator:
         self._tag_idle = None            # why no solve is being produced at all
         self._tag_fix_t = 0.0            # last idle-loop fix attempt
         self._tag_yaw_hist = []          # recent heading residuals, for the UI
+        # Rolling window of recent absolute position measurements. Trust moved
+        # here from the individual frame: see _consume_fix and nav.tag_fusion.
+        self._tag_win = tag_fusion.FixWindow(
+            window_s=float(config.TAGS_WINDOW_S),
+            max_n=int(config.TAGS_WINDOW_N),
+            trim_mm=float(config.TAGS_TRIM_MM))
+        self._tag_pending = None         # why a correction is being held back
+        self._tag_reason = None          # localiser's machine-readable verdict
+        self._degen_run = 0              # consecutive degenerate-geometry frames
+        # ---- micro-parallax ----
+        self._parallax_busy = False      # a manoeuvre owns the rover right now
+        self._parallax_t = 0.0           # last attempt, for the cooldown
+        self._tag_parallax = None        # last attempt's outcome, for the UI
         self._target = None          # {x, z, t, range_m, az_deg, source}
-        self._target_win = []        # [(t, x, z)] raw projections for the median window
-        self._track = None           # {x, z, t, snr} continuity-gated target (anti-teleport)
-        self._track_reject_since = None  # when a far-jump detection started being held
-        self._pending_run = []       # [{x,z,snr,t}] accumulating confirmations for a
-                                      # fresh lock / relock (ghost-detection guard)
-        self._last_tel_seq = None    # last detector telemetry seq consumed (de-dupes
-                                      # repeated polls of the same frame in the run count)
-        # UI-facing summary of the above (see project_detection): whether a
-        # new location is still being accumulated/confirmed, or the track is
-        # currently confirmed and trusted. "none" until the first detection.
-        self._accum = {"phase": "none", "n": 0, "need": int(config.NAV_TARGET_CONFIRM_N)}
+        # Running-average window: the last NAV_TARGET_AVG_N_MAX DETECTION FRAMES
+        # (fresh detections only), newest last, in map mm. The estimate uses
+        # the newest NAV_TARGET_AVG_N of them. See _update_target_tracking.
+        self._det_buf = collections.deque(maxlen=max(1, int(config.NAV_TARGET_AVG_N_MAX)))
+        self._last_tel_seq = None    # last detector telemetry seq consumed (each
+                                      # detector frame enters the window at most once)
+        # UI-facing summary of the window (see _update_target_tracking):
+        # phase "none" until the first detection frame, then "averaging" with
+        # n = frames used, need = N, spread/inliers of the estimate.
+        self._accum = {"phase": "none", "n": 0, "need": int(config.NAV_TARGET_AVG_N)}
         self._goal = None            # {x, z, adjusted: bool}
         self._path = None            # [[x, z], ...] map waypoints of the active plan
         self._leg = 0                # index of the waypoint being driven to
@@ -165,6 +230,7 @@ class Navigator:
         self._stop = threading.Event()
         self._monitor = None
         self._follow_thread = None
+        self._track_thread = None
 
     # ------------------------------------------------------------ lifecycle
     def start(self):
@@ -174,6 +240,12 @@ class Navigator:
         self._monitor.start()
         self._follow_thread = threading.Thread(target=self._follow_loop, daemon=True)
         self._follow_thread.start()
+        # Single dedicated home for the stateful target tracker (see
+        # _track_loop / _update_target_tracking): _monitor_loop, _follow_loop
+        # and the UI all read its cached output through project_detection()
+        # instead of each re-running the tracker at their own cadence.
+        self._track_thread = threading.Thread(target=self._track_loop, daemon=True)
+        self._track_thread.start()
         return self
 
     def stop(self):
@@ -322,6 +394,9 @@ class Navigator:
             else:
                 self._anchor_map = self._map_start
             self._anchor_pose = pose
+            # A re-anchor moves the whole map frame by an unknown amount:
+            # detections projected before it no longer line up with new ones.
+            self._det_buf.clear()
             # The pose is known-good again: everything the drift margin was
             # accumulating for has just been corrected, so start over.
             self._drift_dist_mm = 0.0
@@ -380,17 +455,34 @@ class Navigator:
         planner), and eased in via the anchor so the control loop never sees a
         discontinuity. Deliberately NOT reset_pose(), which re-snapshots
         _anchor_pose and would zero the map yaw.
+
+        Trust is no longer carried by the single frame. Frames are graded into
+        two tiers — one that clears the original thresholds and may act alone,
+        and a looser one that may only contribute to a CONSENSUS of several
+        recent observations that agree with each other (see nav.tag_fusion).
+        That is what lets the per-frame gates open up without the risk opening
+        up with them: a bad frame slipping past a looser gate is diluted by its
+        neighbours rather than applied outright.
         """
         if not config.TAGS_ENABLED or self._detector is None:
             return None
+        if self._parallax_busy:
+            # A parallax run owns the rover and the fix window right now; the
+            # monitor loop must not clear the window out from under it.
+            return None
         if not getattr(self.rover, "_cmd_still", True):
-            return None                                   # moving: don't correct
+            # Moving: don't correct, and drop the window. An observation of
+            # where the rover WAS is not an observation of where it is, and
+            # keeping it would let a pre-move frame corroborate a post-move one.
+            self._tag_win.clear("rover moving")
+            return None
         tel, _seq = self._detector.telemetry.get()
         fix = (tel or {}).get("tag_fix")
         if not fix:
             with self._lock:
                 self._tag_live = None
                 self._tag_idle = (tel or {}).get("tag_idle") or "no tag data"
+            self._note_tag_reason((tel or {}).get("tag_reason"))
             return None
         with self._lock:
             # Live solve, whether or not it ends up applied — this is what makes
@@ -399,28 +491,66 @@ class Navigator:
             self._tag_live = {"n_tags": fix.get("n_tags"), "ids": fix.get("ids"),
                               "rms_px": round(float(fix.get("rms_px", 0.0)), 2),
                               "spread_mm": fix.get("spread_mm"),
+                              # Angular baseline of this observation: the number
+                              # that actually decides whether the geometry is
+                              # usable, now that the gate reasons in those terms.
+                              "range_mm": fix.get("range_mm"),
+                              "spread_ratio": fix.get("spread_ratio"),
                               "audit": fix.get("audit")}
+        self._note_tag_reason(None)
         if time.time() - float(fix.get("t", 0.0)) > float(config.TAGS_FIX_MAX_AGE_S):
             return None
+        return self._consume_fix(fix)
+
+    # ------------------------------------------------------------ fix intake
+    def _fix_tier(self, fix, yaw_err):
+        """Grade a solve: "strict" (may act alone), "loose" (consensus only),
+        or None with the reason it is refused outright.
+
+        The strict thresholds are exactly the ones that were in force before;
+        the loose ones are those scaled by TAGS_LOOSE_*_SCALE. Widening a gate
+        is only safe because a loose frame cannot move the anchor by itself.
+        """
+        n_tags = int(fix.get("n_tags", 1) or 1)
+        if n_tags < int(config.TAGS_MIN_TAGS_FOR_FIX):
+            return None, ("only %d tag(s); need %d (a single tag cannot "
+                          "self-check)" % (n_tags, config.TAGS_MIN_TAGS_FOR_FIX))
         # RMS allowance grows with tag count: more tags impose more mutual
         # constraints, so a legitimately-correct solve still shows a larger
         # residual than a single tag ever does.
-        n_tags = int(fix.get("n_tags", 1) or 1)
         rms_lim = (float(config.TAGS_MAX_RMS_PX)
                    + float(config.TAGS_RMS_PER_TAG_PX) * max(0, n_tags - 1))
         rms = float(fix.get("rms_px", 1e9))
-        if rms > rms_lim:
-            self._tag_rejected += 1
-            self._tag_reject_reason = ("rms %.1fpx > %.1f limit (%d tags) — the tag "
-                                       "offsets in map.json disagree with what the "
-                                       "camera sees" % (rms, rms_lim, n_tags))
-            return None
-        if n_tags < int(config.TAGS_MIN_TAGS_FOR_FIX):
-            self._tag_rejected += 1
-            self._tag_reject_reason = ("only %d tag(s); need %d (a single tag cannot "
-                                       "self-check)" % (n_tags, config.TAGS_MIN_TAGS_FOR_FIX))
-            return None
-        p = self.pose()
+        yaw_lim = float(config.TAGS_MAX_YAW_ERR_DEG)
+        loose = bool(config.TAGS_TEMPORAL_ENABLED)
+        rms_loose = rms_lim * float(config.TAGS_LOOSE_RMS_SCALE)
+        yaw_loose = yaw_lim * float(config.TAGS_LOOSE_YAW_SCALE)
+        if rms > (rms_loose if loose else rms_lim):
+            return None, ("rms %.1fpx > %.1f limit (%d tags) — the tag offsets "
+                          "in map.json disagree with what the camera sees"
+                          % (rms, (rms_loose if loose else rms_lim), n_tags))
+        if yaw_lim > 0.0 and abs(yaw_err) > (yaw_loose if loose else yaw_lim):
+            # The rover never turns deliberately, so a big tag-derived heading
+            # error means the MAP is wrong, not the rover — and the position
+            # half of the same solve is wrong by roughly 40 mm per degree.
+            return None, ("yaw %.1f deg > %.1f limit — map offsets likely wrong"
+                          % (yaw_err, (yaw_loose if loose else yaw_lim)))
+        if rms <= rms_lim and (yaw_lim <= 0.0 or abs(yaw_err) <= yaw_lim):
+            return "strict", None
+        return "loose", ("rms %.1fpx / yaw %.1f deg clear only the loose tier — "
+                         "consensus required" % (rms, yaw_err))
+
+    def _consume_fix(self, fix, pose_ref=None, source="tag"):
+        """Gate, corroborate and ease in one solve. Returns the applied summary
+        or None.
+
+        ``pose_ref`` is the pose the solve describes, for a fix that was taken
+        somewhere other than where the rover is standing now (micro-parallax
+        takes its first view, then moves). The anchor correction is a shift of
+        the whole map frame, so a residual measured at an earlier pose stays
+        valid however far the rover has driven since.
+        """
+        p = pose_ref or self.pose()
         if p is None:
             return None
         # The solve returns the CAMERA's map position; walk back along the
@@ -428,71 +558,357 @@ class Navigator:
         cx, cz = self._camera_map_xz(p)
         rx_fix = float(fix["x"]) - (cx - p["x"])
         rz_fix = float(fix["z"]) - (cz - p["z"])
-        dx, dz = rx_fix - p["x"], rz_fix - p["z"]
-        mag = math.hypot(dx, dz)
+        yaw_err = _wrap_deg(float(fix.get("yaw_deg", p["yaw_deg"])) - p["yaw_deg"])
+        with self._lock:
+            self._tag_yaw_hist.append(yaw_err)
+            del self._tag_yaw_hist[:-40]
+        tier, why = self._fix_tier(fix, yaw_err)
+        if tier is None:
+            self._tag_rejected += 1
+            self._tag_reject_reason = why
+            return None
 
-        # Large corrections need corroboration before they are trusted — the
-        # same challenge-counter idea the radar ghost guard uses. Small ones
-        # apply immediately, since they cannot do much harm.
-        if mag > float(config.TAGS_BIG_FIX_MM):
-            self._tag_run.append((rx_fix, rz_fix))
-            del self._tag_run[:-int(config.TAGS_CONFIRM_N)]
-            if len(self._tag_run) < int(config.TAGS_CONFIRM_N):
+        use_window = bool(config.TAGS_TEMPORAL_ENABLED)
+        if use_window:
+            # One frame must not satisfy an N-frame consensus by being polled N
+            # times: the detector publishes at TAGS_DETECT_HZ while this is
+            # called from two places at a higher rate, so the same solve comes
+            # round again and again. add() de-duplicates on the fix timestamp
+            # and returns False for a repeat, which is also the signal that
+            # there is simply nothing new to act on.
+            fresh = self._tag_win.add(rx_fix, rz_fix, float(fix.get("yaw_deg", 0.0)),
+                                      float(fix.get("rms_px", 0.0)),
+                                      int(fix.get("n_tags", 1) or 1),
+                                      tier=tier, t=float(fix.get("t", time.time())),
+                                      key=(source, fix.get("t")))
+            if not fresh:
                 return None
-            ax = sum(v[0] for v in self._tag_run) / len(self._tag_run)
-            az = sum(v[1] for v in self._tag_run) / len(self._tag_run)
-            if any(math.hypot(v[0] - ax, v[1] - az) > float(config.TAGS_AGREE_MM)
-                   for v in self._tag_run):
-                self._tag_rejected += 1
-                return None                               # candidates disagree
-        else:
-            self._tag_run = []
 
+        mag0 = math.hypot(rx_fix - p["x"], rz_fix - p["z"])
+        # How much corroboration this correction needs. A small correction from
+        # a strict frame applies immediately, exactly as before. A large one
+        # still needs TAGS_CONFIRM_N. A loose frame always needs a consensus,
+        # whatever its size — that is the whole basis for having loosened the
+        # per-frame thresholds in the first place.
+        need = int(config.TAGS_SMALL_FIX_CONSENSUS_N)
+        if mag0 > float(config.TAGS_BIG_FIX_MM):
+            need = max(need, int(config.TAGS_CONFIRM_N))
+        if tier != "strict":
+            need = max(need, int(config.TAGS_LOOSE_CONSENSUS_N))
+
+        cons = None
+        if use_window:
+            cons, cwhy = self._tag_win.consensus(need)
+            if cons is None:
+                with self._lock:
+                    self._tag_pending = {"need": need, "tier": tier, "why": cwhy,
+                                         "window": self._tag_win.summary()}
+                return None
+            fx, fz = cons["x"], cons["z"]
+        else:
+            if need > 1:
+                # Temporal fusion off: fall back to the original behaviour of
+                # requiring N successive candidates that all agree.
+                self._tag_run.append((rx_fix, rz_fix))
+                del self._tag_run[:-int(config.TAGS_CONFIRM_N)]
+                if len(self._tag_run) < int(config.TAGS_CONFIRM_N):
+                    return None
+                ax = sum(v[0] for v in self._tag_run) / len(self._tag_run)
+                az = sum(v[1] for v in self._tag_run) / len(self._tag_run)
+                if any(math.hypot(v[0] - ax, v[1] - az) > float(config.TAGS_AGREE_MM)
+                       for v in self._tag_run):
+                    self._tag_rejected += 1
+                    return None                       # candidates disagree
+            else:
+                self._tag_run = []
+            fx, fz = rx_fix, rz_fix
+
+        dx, dz = fx - p["x"], fz - p["z"]
+        mag = math.hypot(dx, dz)
         a = float(config.TAGS_FIX_ALPHA)
         step = float(config.TAGS_FIX_MAX_STEP_MM)
         sx, sz = dx * a, dz * a
         smag = math.hypot(sx, sz)
         if smag > step and smag > 1e-9:
             sx, sz = sx * step / smag, sz * step / smag
-        yaw_err = _wrap_deg(float(fix.get("yaw_deg", p["yaw_deg"])) - p["yaw_deg"])
-        with self._lock:
-            self._tag_yaw_hist.append(yaw_err)
-            del self._tag_yaw_hist[:-40]
-        yaw_lim = float(config.TAGS_MAX_YAW_ERR_DEG)
-        if yaw_lim > 0.0 and abs(yaw_err) > yaw_lim:
-            # The rover never turns deliberately, so a big tag-derived heading
-            # error means the MAP is wrong, not the rover — and the position
-            # half of the same solve is wrong by roughly 40 mm per degree.
-            self._tag_rejected += 1
-            self._tag_reject_reason = ("yaw %.1f deg > %.1f limit — map offsets "
-                                       "likely wrong" % (yaw_err, yaw_lim))
-            return None
         with self._lock:
             if self._anchor_map is not None:
                 # Shifting the anchor moves the whole map frame under the rover;
                 # yaw is untouched because it never references _anchor_map.
                 self._anchor_map = (self._anchor_map[0] + sx, self._anchor_map[1] + sz)
+                # Samples already in the target window were projected from the
+                # pre-correction pose; move them with the map frame so the
+                # running average stays consistent with new projections.
+                for q in self._det_buf:
+                    q["x"] += sx
+                    q["z"] += sz
             # A measured fix is a known-good pose: the drift margin starts over.
             self._drift_dist_mm = 0.0
             self._drift_turn_deg = 0.0
             self._drift_last_pose = None
             self._tag_applied += 1
+            self._tag_pending = None
             self._tag_last = {"t": round(time.time(), 2),
                               "n_tags": fix.get("n_tags"), "ids": fix.get("ids"),
                               "rms_px": round(float(fix.get("rms_px", 0.0)), 2),
                               "resid_mm": round(mag), "applied_mm": round(math.hypot(sx, sz)),
-                              "yaw_err_deg": round(yaw_err, 2)}
+                              "yaw_err_deg": round(yaw_err, 2),
+                              "source": source, "tier": tier,
+                              "spread_mm": fix.get("spread_mm"),
+                              "range_mm": fix.get("range_mm"),
+                              "spread_ratio": fix.get("spread_ratio"),
+                              # What actually backed this correction: how many
+                              # observations agreed, over what span, and how
+                              # tightly. A wide scatter with a passing consensus
+                              # is the early warning that the map is drifting
+                              # out of agreement with the arena.
+                              "consensus": ({"n": cons["n"], "need": cons["need"],
+                                             "span_s": cons["span_s"],
+                                             "scatter_mm": cons["scatter_mm"],
+                                             "dropped": cons["dropped"],
+                                             "strict": cons["strict"],
+                                             "loose": cons["loose"]}
+                                            if cons else {"n": 1, "need": need,
+                                                          "span_s": 0.0,
+                                                          "scatter_mm": 0.0,
+                                                          "dropped": 0,
+                                                          "strict": 1, "loose": 0})}
             out = dict(self._tag_last)
         return out
+
+    def _note_tag_reason(self, code):
+        """Track how long the localiser has been refusing on GEOMETRY.
+
+        Only "degenerate" counts: it is the one failure that moving a little
+        sideways can fix, and it must not be confused with "nothing in view"
+        (where a jog would achieve nothing) or "unknown ids" (where the fix is
+        in map.json). Counting it here is what lets the monitor loop decide the
+        rover should manufacture its own baseline."""
+        with self._lock:
+            self._tag_reason = code
+            if code == "degenerate":
+                self._degen_run += 1
+            else:
+                self._degen_run = 0
+
+    # ------------------------------------------------------- micro-parallax
+    def parallax_fix(self, baseline_mm=None, direction=None):
+        """Manufacture a stereo baseline by jogging sideways, and fuse the pair.
+
+        When the rover can only see a narrow or single-column tag set there is
+        nothing left to gate: the geometry itself carries no information about
+        sideways position, and no threshold can recover what was never there.
+        The angle has to come from somewhere else — so the rover makes it. It
+        strafes a small, known distance while tracking the same tags, and the
+        two views separated by a MEASURED baseline fuse into one well-conditioned
+        solve, the way a stereo pair would (tag_localizer.solve_multiview).
+
+        Three properties make this trustworthy where a single view is not:
+          * the baseline is measured by the T265 over a sub-second move, which
+            is the regime where VIO is reliable — it drifts over minutes, not
+            over 200 mm;
+          * the strafe holds yaw, so the rotation really is common to both views,
+            which is what the fusion assumes (and it is re-checked afterwards);
+          * the baseline runs across the line of sight, the optimal direction,
+            rather than partly along it as panel-mounted tags usually do.
+
+        Returns (ok, message, detail).
+        """
+        if not (config.TAGS_ENABLED and config.TAGS_PARALLAX_ENABLED):
+            return False, "micro-parallax disabled in config", None
+        det = self._detector
+        if det is None or not hasattr(det, "tag_observation"):
+            return False, "detector has no tag observations to pair", None
+        if self._nav_thread is not None and self._nav_thread.is_alive():
+            return False, "navigation in progress", None
+        with self._lock:
+            if self._parallax_busy:
+                return False, "a parallax run is already under way", None
+            self._parallax_busy = True
+        try:
+            return self._parallax_run(det, baseline_mm, direction)
+        except Exception as exc:
+            # A manoeuvre that throws must not take the monitor thread or the
+            # API request with it, and must not leave the busy flag stuck.
+            return False, "micro-parallax failed: %s" % exc, None
+        finally:
+            with self._lock:
+                self._parallax_busy = False
+                self._parallax_t = time.time()
+                self._degen_run = 0        # give the new geometry a fresh start
+
+    def _parallax_run(self, det, baseline_mm, direction):
+        t_out = float(config.TAGS_PARALLAX_OBS_TIMEOUT_S)
+        if self.rover.is_busy():
+            return False, "rover is busy", None
+        p0 = self.pose()
+        if p0 is None:
+            return False, "no rover pose", None
+        # The window describes where the rover is standing NOW; it is about to
+        # stop being true.
+        self._tag_win.clear("parallax manoeuvre")
+        view_a = det.tag_observation(newer_than=time.time(), timeout=t_out)
+        if view_a is None:
+            return False, ("no tags in view to pair — micro-parallax adds a "
+                           "viewpoint, it cannot conjure markers"), None
+        # Size the jog from the range: what buys conditioning is the ANGLE the
+        # baseline subtends, so a fixed number of millimetres is right at one
+        # distance and useless at every other.
+        rng = det.tag_range_mm()
+        if baseline_mm is None:
+            want = (float(config.TAGS_PARALLAX_RATIO_TARGET) * float(rng)
+                    if rng else 200.0)
+            baseline_mm = max(float(config.TAGS_PARALLAX_BASELINE_MIN_MM),
+                              min(float(config.TAGS_PARALLAX_BASELINE_MAX_MM), want))
+        baseline_mm = abs(float(baseline_mm))
+        # Which way to step. Both are equally good geometrically, so the choice
+        # is purely about what the rover can safely occupy.
+        margin = float(config.TAGS_PARALLAX_CLEARANCE_MM)
+        options = [1.0, -1.0]
+        if direction in ("left", "-", -1):
+            options = [-1.0, 1.0]
+        sign = None
+        for cand in options:
+            nx, nz = tag_fusion.lateral_offset_xz(p0["x"], p0["z"], p0["yaw_deg"],
+                                                  cand * (baseline_mm + margin))
+            if self._ignore_obstacles or self._center_free(nx, nz):
+                sign = cand
+                break
+        if sign is None:
+            return False, ("no clear %.0f mm of lateral room either side — the "
+                           "rover cannot make a baseline from here"
+                           % (baseline_mm + margin)), None
+
+        with self._lock:
+            hold_yaw = self._anchor_pose["yaw"] if self._anchor_pose else None
+        moved_back = False
+        try:
+            res = self.rover.move(right=sign * baseline_mm, forward=0.0,
+                                  units="mm", hold_yaw=hold_yaw)
+            if res is None or not res:
+                return False, ("parallax jog failed (%s)"
+                               % (res.reason if res is not None else "no result")), None
+            # Motion blur destroys corner precision, which is the entire basis
+            # of the fix. Let the base settle before looking.
+            self._stop.wait(float(config.TAGS_PARALLAX_SETTLE_S))
+            p1 = self.pose()
+            if p1 is None:
+                return False, "lost rover pose mid-manoeuvre", None
+            # The fusion assumes one common rotation. Check that rather than
+            # trusting it: a yaw excursion during the strafe would tilt the
+            # second view and quietly bias the pooled solve.
+            dyaw = _wrap_deg(p1["yaw_deg"] - p0["yaw_deg"])
+            if abs(dyaw) > float(config.TAGS_PARALLAX_MAX_YAW_DRIFT_DEG):
+                return False, ("heading moved %.1f deg during the jog (limit "
+                               "%.1f) — the two views no longer share a rotation, "
+                               "so they cannot be fused"
+                               % (dyaw, config.TAGS_PARALLAX_MAX_YAW_DRIFT_DEG)), None
+            dx, dz = p1["x"] - p0["x"], p1["z"] - p0["z"]
+            achieved = math.hypot(dx, dz)
+            if achieved < float(config.TAGS_PARALLAX_MIN_SPREAD_MM):
+                return False, ("only %.0f mm of baseline achieved (wanted %.0f) "
+                               "— the rover did not actually move"
+                               % (achieved, baseline_mm)), None
+            view_b = det.tag_observation(newer_than=time.time(), timeout=t_out)
+            if view_b is None:
+                return False, "lost sight of the tags after the jog", None
+            # MEASURED displacement, not the commanded one: the point of using
+            # the T265 here is that it reports what actually happened.
+            delta = tag_fusion.map_delta_to_world_vec(dx, dz)
+            fix, why = det.tag_solve_views(
+                [{"obs": view_a["obs"], "delta": (0.0, 0.0, 0.0)},
+                 {"obs": view_b["obs"], "delta": delta}],
+                min_ratio=float(config.TAGS_PARALLAX_MIN_RATIO),
+                min_spread_mm=float(config.TAGS_PARALLAX_MIN_SPREAD_MM))
+        finally:
+            # Put the rover back where it was found, whatever happened above —
+            # including on a failure, so a refused fusion never leaves the demo
+            # displaced. Skipped only if the operator cancelled.
+            #
+            # The return is driven by the MEASURED displacement, not by undoing
+            # the commanded one. A jog that stalled against something, or that
+            # timed out half way, would otherwise be "undone" by a full-length
+            # move in the opposite direction and leave the rover further from
+            # where it started than the manoeuvre ever took it.
+            if config.TAGS_PARALLAX_RETURN and not self._cancel.is_set():
+                try:
+                    pnow = self.pose()
+                    if pnow is not None:
+                        mdx, mdz = p0["x"] - pnow["x"], p0["z"] - pnow["z"]
+                        if math.hypot(mdx, mdz) > 5.0:
+                            # Map delta -> this rover's own (right, forward),
+                            # the same rotation each drive leg uses.
+                            g = math.radians(pnow["yaw_deg"])
+                            mr, mf = mdx, -mdz
+                            cr = mr * math.cos(g) + mf * math.sin(g)
+                            cf = -mr * math.sin(g) + mf * math.cos(g)
+                            self.rover.move(right=cr, forward=cf, units="mm",
+                                            hold_yaw=hold_yaw)
+                            moved_back = True
+                except Exception:
+                    pass
+        detail = {"t": round(time.time(), 2),
+                  "baseline_mm": round(achieved),
+                  "commanded_mm": round(sign * baseline_mm),
+                  "range_mm": (round(rng) if rng else None),
+                  "returned": moved_back,
+                  "yaw_drift_deg": round(dyaw, 2),
+                  "ids_a": view_a["obs"]["ids"], "ids_b": view_b["obs"]["ids"]}
+        if fix is None:
+            detail["ok"] = False
+            detail["why"] = why
+            with self._lock:
+                self._tag_parallax = detail
+            return False, "parallax pair not usable: %s" % why, detail
+        detail.update({"ok": True, "rms_px": round(float(fix.get("rms_px", 0.0)), 2),
+                       "spread_mm": fix.get("spread_mm"),
+                       "spread_ratio": fix.get("spread_ratio"),
+                       "n_tags": fix.get("n_tags")})
+        # Consume against the pose at VIEW A, which is what the solve describes.
+        applied = self._consume_fix(fix, pose_ref=p0, source="parallax")
+        detail["applied"] = applied
+        with self._lock:
+            self._tag_parallax = detail
+        if applied is None:
+            return True, ("parallax fix solved (rms %.1f px, %.0f mm baseline) "
+                          "but not yet applied — awaiting corroboration"
+                          % (detail["rms_px"], detail["baseline_mm"])), detail
+        return True, ("parallax fix applied: %d mm residual, %d mm eased in, "
+                      "%.0f mm baseline"
+                      % (applied["resid_mm"], applied["applied_mm"],
+                         detail["baseline_mm"])), detail
+
+    def _parallax_worker(self):
+        ok, msg, _d = self.parallax_fix()
+        with self._lock:
+            if not ok:
+                self._message = "micro-parallax: %s" % msg
 
     def _zupt_sample(self):
         """Zero-velocity update. Called while the rover is stopped between legs:
         true velocity is zero, so any pose movement the T265 reports over the
         window is pure drift. Records it as a rate (mm/s) — the coefficient the
-        drift margin and any 'stop and re-fix' policy would key off."""
+        drift margin and any 'stop and re-fix' policy would key off.
+
+        This blocks for NAV_ZUPT_WINDOW_S, so sampling before every single leg
+        put that pause on every waypoint of a multi-leg path. The drift rate
+        does not need a fresh reading that often: skip the sample (and its
+        wait) when the last one completed less than NAV_ZUPT_MIN_INTERVAL_S
+        ago, UNLESS T265 confidence is currently below NAV_MIN_START_CONF --
+        that is exactly when a fresh reading is worth pausing for."""
         win = float(config.NAV_ZUPT_WINDOW_S)
         if win <= 0.0:
             return
+        min_interval = float(config.NAV_ZUPT_MIN_INTERVAL_S)
+        now = time.time()
+        if min_interval > 0.0:
+            with self._lock:
+                due = (now - self._zupt_last_t) >= min_interval
+            if not due:
+                pr = self.rover.get_pose()
+                conf = pr.get("confidence") if pr else None
+                if conf is None or conf >= int(config.NAV_MIN_START_CONF):
+                    return    # sampled recently enough and tracking is healthy
         a = self.pose()
         if a is None:
             return
@@ -507,6 +923,7 @@ class Navigator:
             # running mean, so one noisy sample doesn't dominate the readout
             self._zupt_mm_s = rate if prev is None else (prev * n + rate) / (n + 1)
             self._zupt_samples = n + 1
+            self._zupt_last_t = now
 
     def _await_confidence(self):
         """Hold before starting a leg until T265 tracking confidence recovers.
@@ -675,170 +1092,147 @@ class Navigator:
             return {"x": gx, "z": gz, "adjusted": False}
         step = float(config.NAV_ADJUST_STEP_MM)
         max_d = float(config.NAV_ADJUST_MAX_MM)
-        best, best_cost = None, None
         n = int(max_d / step)
+        # Same candidate set and the same cost function as before (changing
+        # standoff is cheap, moving sideways is expensive -- see the formula
+        # below), but evaluated in ASCENDING cost order and returned on the
+        # first one that turns out to be free. _center_free() is the
+        # expensive part (it walks every obstacle) and used to be called for
+        # all ~(2n+1)^2 candidates whenever the ideal spot was blocked; now
+        # it is only called until a usable candidate is found, which for a
+        # lightly-obstructed arena is typically the first few checked.
+        # Ranking is computed for every candidate up front and _center_free()
+        # is the only thing skipped early, so the candidate this returns is
+        # IDENTICAL to the old exhaustive arg-min search -- just reached
+        # without necessarily visiting every candidate.
+        candidates = []
         for i in range(-n, n + 1):
             for j in range(-n, n + 1):
                 dx, dz = i * step, j * step
                 if dx == 0 and dz == 0:
                     continue
-                cx, cz = gx + dx, gz + dz
-                if cz < tz + smin:     # would crowd the person
+                if gz + dz < tz + smin:     # would crowd the person
                     continue
-                if not self._center_free(cx, cz):
-                    continue
-                # Soft threshold: changing the standoff is cheap (shrinking a
-                # touch dearer than growing), moving sideways is expensive.
                 cost = 3.0 * abs(dx) + (1.5 * -dz if dz < 0 else 1.0 * dz)
-                if best_cost is None or cost < best_cost:
-                    best, best_cost = (cx, cz), cost
-        if best is None:
-            return None
-        return {"x": best[0], "z": best[1], "adjusted": True}
+                candidates.append((cost, dx, dz))
+        candidates.sort(key=lambda c: c[0])   # stable: ties keep this scan's order
+        for _cost, dx, dz in candidates:
+            cx, cz = gx + dx, gz + dz
+            if self._center_free(cx, cz):
+                return {"x": cx, "z": cz, "adjusted": True}
+        return None
 
     # ------------------------------------------------------------ target projection
+    def _track_loop(self):
+        """Background home of the stateful target tracker (see
+        _update_target_tracking): runs it on ONE dedicated cadence
+        (NAV_TRACK_UPDATE_S) so the running-average window is advanced
+        exactly once per detector frame,
+        however many places want to read the result. _monitor_loop,
+        _follow_loop and the UI (via state()) all just read the cached
+        self._target through project_detection() below instead of each
+        re-running the tracker themselves at their own cadence."""
+        interval = float(config.NAV_TRACK_UPDATE_S)
+        if interval <= 0.0:
+            interval = 0.1
+        while not self._stop.is_set():
+            try:
+                self._update_target_tracking()
+            except Exception:
+                pass
+            self._stop.wait(interval)
+
     def project_detection(self):
-        """Project the detector's live fused target (bearing + radar range)
-        into map mm and remember it. Returns the target dict or None."""
+        """Current tracked target (see _track_loop / _update_target_tracking):
+        a cheap read of the shared cache, NOT a re-run of the tracker. This is
+        what navigation, FOLLOW and the UI all call. Returns the target dict
+        or None."""
+        with self._lock:
+            return dict(self._target) if self._target else None
+
+    def _update_target_tracking(self):
+        """Advance the running-average target by at most ONE detection frame.
+
+        Runs on its own cadence via _track_loop -- see project_detection()
+        for the cheap accessor everything else should call instead.
+
+        Only a NEW detector frame that carries a FRESH detection (detector.py
+        target["fresh"]: a real model box / a real radar cluster this frame,
+        not a coasted box or a held radar lock) and projects to a valid map
+        position is added to the window. Frames without a detection do NOT
+        advance it, so the window is always "the last N frames that contained
+        a detection", ending at the current one. The estimate uses whatever is
+        in the window (1..N): it never waits for the window to fill."""
         if self._detector is None:
             return None
+        now = time.time()
+        forget = float(config.NAV_TARGET_FORGET_S)
+        with self._lock:
+            # Long loss: the window holds a position the person has likely
+            # left. Clear it so the next detection starts a fresh lock.
+            if self._det_buf and now - self._det_buf[-1]["t"] > forget:
+                self._det_buf.clear()
+                self._accum = {"phase": "none", "n": 0,
+                               "need": int(config.NAV_TARGET_AVG_N)}
         tel, seq = self._detector.telemetry.get()
         if not tel:
             return None
+        with self._lock:
+            if seq == self._last_tel_seq:
+                return None                 # same detector frame as last time
+            self._last_tel_seq = seq
         tgt = tel.get("target")
-        if not tgt or tgt.get("range") is None or tgt.get("az") is None:
+        if not tgt:
+            return None
+        # Detectors that predate the freshness flag: treat every frame with a
+        # target as a detection frame (the old behaviour).
+        if not tgt.get("fresh", True):
+            return None
+        az = tgt.get("raw_az") if tgt.get("raw_az") is not None else tgt.get("az")
+        rng = tgt.get("raw_range") if tgt.get("raw_range") is not None else tgt.get("range")
+        if rng is None or az is None:
             return None
         # Radar is only rejected here while moving if the detector has no
-        # lock to maintain (it clears the target in that case, so tgt would
-        # already be None/non-radar). An ALREADY-acquired lock is kept live
-        # by the detector's tracker through the rover's own motion (purely
-        # spatial maintenance, no Doppler involved -- see radar_tracker.py),
-        # so it's trusted here the same as any other live source. Acquiring
-        # a brand-new radar lock still requires the rover to be stationary;
-        # that rule lives in RadarTracker/detector.py, not here.
+        # lock to maintain (it clears the target in that case). An ALREADY-
+        # acquired lock is kept live by the detector's tracker through the
+        # rover's own motion (purely spatial, no Doppler) -- see radar_tracker.py.
         p = self.pose()
         if p is None:
             return None
-        rng_mm = float(tgt["range"]) * 1000.0
+        rng_mm = float(rng) * 1000.0
         # Bearing and range are measured from the COLOUR CAMERA, which sits at
         # its own lever arm from the rover's turn centre. Projecting from the
         # rover centre makes a stationary target appear to swing every time the
         # rover rotates, by the camera's arc. Walk out to the camera first.
         cx, cz = self._camera_map_xz(p)
-        bearing = math.radians(p["yaw_deg"] + float(tgt["az"]))
+        bearing = math.radians(p["yaw_deg"] + float(az))
         tx = cx + rng_mm * math.sin(bearing)
         tz = cz - rng_mm * math.cos(bearing)
         # Clamp into the map so a noisy range can't paint the marker off-canvas.
         tx = max(0.0, min(self.map_w, tx))
         tz = max(0.0, min(self.map_d, tz))
-        # Invalidate detections that land in a no-target zone (obstacle + clear
-        # margin): a real target can't be there, so do NOT update the target /
-        # track — the rover never generates a goal from such a detection. The
-        # previous target simply holds and ages out as usual.
+        # A detection inside a no-target zone (obstacle + clear margin) cannot
+        # be a real target: it is not a valid detection frame and does not
+        # enter the window. The previous target simply holds.
         if self._in_exclusion(tx, tz):
             return None
-        # Reflected intensity (mmWave only; None for a vision-sourced target).
-        # Used below purely as a CONSISTENCY check against a reference value —
-        # never as an absolute quality gate here (the radar tracker already
-        # applies its own SNR floor before it ever offers a target).
         is_radar = tgt.get("source") == "radar"
-        snr = float(tgt["snr_peak"]) if (is_radar and tgt.get("snr_peak") is not None) else None
-        now = time.time()
-        win = float(config.NAV_TARGET_WINDOW_S)
+        snr = (float(tgt["snr_peak"]) if (is_radar and tgt.get("snr_peak") is not None)
+               else None)
         with self._lock:
-            # Median over a short window: a transient wrong detection is an
-            # outlier and gets out-voted, so the target never jumps short-term;
-            # a sustained move shifts the median once it dominates the window.
-            self._target_win = [(ts, x, z) for (ts, x, z) in self._target_win
-                                if now - ts <= win] + [(now, tx, tz)]
-            fx = _median([x for _, x, _ in self._target_win])
-            fz = _median([z for _, _, z in self._target_win])
-            is_new_frame = seq != self._last_tel_seq
-            self._last_tel_seq = seq
-
-            jump = float(config.NAV_TARGET_JUMP_MM)
-            relock = float(config.NAV_TARGET_RELOCK_S)
-            forget = float(config.NAV_TARGET_FORGET_S)
-            confirm_n = max(1, int(config.NAV_TARGET_CONFIRM_N))
-            snr_tol = float(config.NAV_TARGET_SNR_TOL)
-
-            def _snr_close(a, b):
-                """True when two radar reflection intensities are within
-                snr_tol of each other (relative tolerance) -- a stand-in for
-                "this still looks like the same reflector, not interference".
-                Either side missing (non-radar, or no baseline yet) -> no
-                opinion, so it never blocks a vision-side comparison."""
-                if a is None or b is None:
-                    return True
-                return abs(a - b) <= snr_tol * max(a, b, 1e-6)
-
-            tr = self._track
-            stale = tr is None or (now - tr["t"]) > forget
-            near = (not stale
-                    and math.hypot(fx - tr["x"], fz - tr["z"]) <= jump
-                    and _snr_close(snr, tr.get("snr")))
-
-            if near:
-                # Trusted continuity: light EMA update straight onto the track,
-                # same as before -- an already-locked target doesn't need to
-                # re-earn trust every frame, only a NEW or relocated one does.
-                a = 0.5
-                self._track = {"x": a * fx + (1 - a) * tr["x"],
-                               "z": a * fz + (1 - a) * tr["z"], "t": now,
-                               "snr": snr if snr is not None else tr.get("snr")}
-                self._track_reject_since = None
-                self._pending_run = []
-                self._accum = {"phase": "confirmed", "n": confirm_n, "need": confirm_n}
-            else:
-                # Disagrees with the current track (continuity gate), or there's
-                # no usable track yet (first-ever lock / long loss). GHOST GUARD:
-                # this is only committed once NAV_TARGET_CONFIRM_N mutually-
-                # consistent, DISTINCT detector frames have accumulated — a
-                # single-frame ghost never earns enough corroboration to
-                # overwrite the track (or seed a new one) and just ages out of
-                # the accumulation window. `is_new_frame` de-dupes repeated
-                # polls of the same detector output (this method is called
-                # faster than the detector produces frames) so the count
-                # reflects genuinely separate observations.
-                if not stale and self._track_reject_since is None:
-                    self._track_reject_since = now
-                if is_new_frame:
-                    run = self._pending_run
-                    ref = run[-1] if run else None
-                    consistent = (ref is None
-                                  or (math.hypot(fx - ref["x"], fz - ref["z"]) <= jump
-                                      and _snr_close(snr, ref.get("snr"))))
-                    if consistent:
-                        run.append({"x": fx, "z": fz, "snr": snr, "t": now})
-                    else:
-                        run = [{"x": fx, "z": fz, "snr": snr, "t": now}]  # restart the run here
-                    # Bound the run to the relock window so it can't be stitched
-                    # together from detections spread too far apart in time.
-                    self._pending_run = [q for q in run if now - q["t"] <= relock]
-
-                ready = len(self._pending_run) >= confirm_n
-                sustained = stale or (now - self._track_reject_since >= relock)
-                if ready and sustained:
-                    gx = _median([q["x"] for q in self._pending_run])
-                    gz = _median([q["z"] for q in self._pending_run])
-                    snrs = [q["snr"] for q in self._pending_run if q["snr"] is not None]
-                    gsnr = _median(snrs) if snrs else None
-                    self._track = {"x": gx, "z": gz, "t": now, "snr": gsnr}
-                    self._track_reject_since = None
-                    self._pending_run = []
-                    self._accum = {"phase": "confirmed", "n": confirm_n, "need": confirm_n}
-                else:
-                    if tr is not None:
-                        tr["t"] = now   # hold the last verified position while we wait
-                    self._accum = {"phase": "accumulating",
-                                   "n": len(self._pending_run), "need": confirm_n}
-
-            if self._track is None:
-                return None   # still accumulating confirmations; nothing verified yet
-            fx, fz = self._track["x"], self._track["z"]
-            t = {"x": fx, "z": fz, "t": now,
-                 "range_m": round(float(tgt["range"]), 2),
-                 "az_deg": float(tgt["az"]), "source": tgt.get("source")}
+            self._det_buf.append({"t": now, "x": tx, "z": tz, "snr": snr})
+            n_want = max(1, int(config.NAV_TARGET_AVG_N))
+            window = list(self._det_buf)[-n_want:]
+            est = _robust_average(window,
+                                  float(config.NAV_TARGET_INLIER_MM),
+                                  float(config.NAV_TARGET_JUMP_MM))
+            self._accum = {"phase": "averaging", "n": len(window), "need": n_want,
+                           "spread_mm": round(est["spread"]),
+                           "inliers": est["inliers"]}
+            t = {"x": est["x"], "z": est["z"], "t": now,
+                 "range_m": round(float(rng), 2),
+                 "az_deg": float(az), "source": tgt.get("source"),
+                 "spread_mm": round(est["spread"]), "n": len(window)}
             self._target = t
         return t
 
@@ -969,7 +1363,15 @@ class Navigator:
                 # so its TRUE velocity is zero and any pose change the T265
                 # reports here is drift, measured directly.
                 self._zupt_sample()
-                self.apply_tag_fix()        # absolute correction while stopped
+                # Absolute (tag) correction is no longer forced HERE. It runs
+                # as its own continuous background service (_monitor_loop),
+                # applying whenever the rover happens to be stationary rather
+                # than being woven into this leg's critical path. Navigation
+                # just reads self.pose() -- above and on the next leg -- which
+                # already carries whatever the localisation service has
+                # applied so far. Same gates, same consensus/RMS/spread
+                # thresholds, same eased-in correction: only WHEN it runs has
+                # changed, never what it does or how cautious it is.
                 # Tracking-confidence gate: Low confidence is exactly when VIO
                 # drift accrues fastest. Wait briefly for it to recover; if it
                 # doesn't, still go (never strand a demo) but at reduced speed.
@@ -1130,17 +1532,21 @@ class Navigator:
             self._ignore_obstacles = bool(enabled)
         return self._ignore_obstacles
 
-    # ------------------------------------------------------------ ghost-guard confirm count
-    def set_confirm_n(self, n):
-        """Operator-settable ghost-detection guard threshold: how many
-        mutually-consistent detector frames must accumulate before a new/
-        relocated target is trusted (see project_detection). Clamped to
-        [1, 10]. project_detection() re-reads config.NAV_TARGET_CONFIRM_N
-        live every call, so this takes effect on the very next detection --
-        no restart needed. Returns the clamped value actually applied."""
-        applied = max(1, min(10, int(n)))
+    # ------------------------------------------------------------ running-average window
+    def set_avg_n(self, n):
+        """Operator-settable running-average window: how many of the most
+        recent DETECTION FRAMES the target estimate averages over (see
+        _update_target_tracking). Clamped to [NAV_TARGET_AVG_N_MIN,
+        NAV_TARGET_AVG_N_MAX]. Takes effect on the next detection frame; the
+        buffer already holds up to the max, so a larger N uses existing history
+        immediately rather than waiting. Returns the value actually applied."""
+        lo = int(config.NAV_TARGET_AVG_N_MIN)
+        hi = int(config.NAV_TARGET_AVG_N_MAX)
+        applied = max(lo, min(hi, int(n)))
         with self._lock:
-            config.NAV_TARGET_CONFIRM_N = applied
+            config.NAV_TARGET_AVG_N = applied
+            if self._accum.get("phase") != "none":
+                self._accum["need"] = applied
         return applied
 
     # ------------------------------------------------------------ auto / follow mode
@@ -1158,12 +1564,12 @@ class Navigator:
             self._follow = bool(enabled)
             if self._follow:
                 self._auto = False
-                # Fresh lock: drop any stale track so follow locks onto wherever
-                # the person is right now (no carry-over teleport from before).
-                # Still has to pass the confirm-N ghost guard before it commits.
-                self._track = None
-                self._track_reject_since = None
-                self._pending_run = []
+                # Fresh lock: empty the running-average window so follow locks
+                # onto wherever the person is right now (no carry-over from
+                # detections made before follow was switched on).
+                self._det_buf.clear()
+                self._accum = {"phase": "none", "n": 0,
+                               "need": int(config.NAV_TARGET_AVG_N)}
 
     def _follow_loop(self):
         """FOLLOW = a strict SENSE-while-stationary -> COMMIT -> MOVE -> re-stop
@@ -1191,18 +1597,29 @@ class Navigator:
         replan_mm = float(config.NAV_FOLLOW_REPLAN_MM)
         cap = float(config.NAV_FOLLOW_CYCLE_S)
         still_confirm = float(config.NAV_FOLLOW_STILL_CONFIRM_S)
+        side_switch_mm = float(config.NAV_FOLLOW_SIDE_SWITCH_MM)
         still_since = time.time()
         was_following = False
+        # Once a radar (moving-point) target has cleared the stationary-dwell
+        # check below, its lock is maintained by the detector's own tracker
+        # purely spatially through the rover's own motion (see
+        # project_detection / radar_tracker.py) -- it does not need to
+        # re-earn stillness after every stop. Reset only when the track is
+        # actually lost (a fresh acquisition, which DOES need to prove itself
+        # stationary again).
+        radar_confirmed = False
         while not self._stop.is_set():
             with self._lock:
                 follow = self._follow
             if not follow:
                 was_following = False
+                radar_confirmed = False
                 self._stop.wait(0.1)
                 continue
             if not was_following:                  # just enabled -> fresh dwell
                 was_following = True
                 still_since = time.time()
+                radar_confirmed = False
             # ---------------- SENSE PHASE (must be stationary) ----------------
             if self.rover.is_busy():
                 still_since = time.time()          # still moving -> reset the dwell
@@ -1210,18 +1627,26 @@ class Navigator:
                 continue
             t = self.project_detection()
             if t is None:
+                radar_confirmed = False   # track lost -> next lock must re-earn stillness
                 self._stop.wait(idle)
                 continue
-            # HARD INVARIANT: a radar/moving-point target is accepted ONLY once the
-            # rover has been confirmed stationary long enough to have re-acquired a
-            # moving cluster while still. Vision (RGB/thermal) is unconstrained.
-            if t.get("source") == "radar" and (time.time() - still_since) < still_confirm:
+            # HARD INVARIANT: a BRAND-NEW radar/moving-point acquisition is accepted
+            # ONLY once the rover has been confirmed stationary long enough to have
+            # re-acquired a moving cluster while still. Vision (RGB/thermal) is
+            # unconstrained. An already-confirmed radar lock is exempt: it is kept
+            # live by the detector's tracker purely spatially through the rover's
+            # own motion (no Doppler involved), the same as any other live source,
+            # so it does not need to wait out this dwell again after every stop.
+            if (t.get("source") == "radar" and not radar_confirmed
+                    and (time.time() - still_since) < still_confirm):
                 with self._lock:
                     if self._status not in ("moving", "planning"):
                         self._status = "idle"
                         self._message = "follow: confirming stationary mmWave lock…"
                 self._stop.wait(0.1)
                 continue
+            if t.get("source") == "radar":
+                radar_confirmed = True
             # ---------------- COMMIT + MOVE PHASE ----------------
             ok, _msg = self.navigate_to_target(t["x"], t["z"])
             with self._lock:
@@ -1246,13 +1671,32 @@ class Navigator:
                 # the rover's own ego-motion), so either source can trigger
                 # this re-plan.
                 nt = self.project_detection()
-                if (nt is not None
-                        and math.hypot(nt["x"] - gx, nt["z"] - gz) >= replan_mm):
-                    self.cancel()
-                    with self._lock:
-                        self._status = "moving"
-                        self._message = "follow: target moved, re-targeting"
-                    break
+                if nt is not None:
+                    moved_mm = math.hypot(nt["x"] - gx, nt["z"] - gz)
+                    # Receding-horizon rule: a leg already under way stays
+                    # alive through small target motion -- only cut it short
+                    # when the move is BIG (moved_mm >= replan_mm) or the
+                    # target crossed to the rover's other side (walked from
+                    # the left half-plane to the right, or vice versa), which
+                    # means the leg in progress now heads toward the wrong
+                    # side however small the raw distance is. The minimum-
+                    # swing guard keeps noise near dead-centre from flapping
+                    # this.
+                    p_now = self.pose()
+                    switched_side = False
+                    if p_now is not None:
+                        side_old = gx - p_now["x"]
+                        side_new = nt["x"] - p_now["x"]
+                        switched_side = (side_old * side_new < 0
+                                        and abs(side_new - side_old) >= side_switch_mm)
+                    if moved_mm >= replan_mm or switched_side:
+                        self.cancel()
+                        with self._lock:
+                            self._status = "moving"
+                            self._message = ("follow: target crossed sides, re-targeting"
+                                             if switched_side else
+                                             "follow: target moved, re-targeting")
+                        break
                 if time.time() >= deadline:
                     self.cancel()                  # stuck-backstop -> treat as done
                     with self._lock:
@@ -1263,6 +1707,29 @@ class Navigator:
             # Move ended -> rover is stopping; open a fresh stationary window so the
             # next radar lock must be re-confirmed while still.
             still_since = time.time()
+
+    def _maybe_parallax(self, busy):
+        """Start a parallax run if the geometry has been unusable long enough.
+
+        Deliberately conservative about WHEN: never during a navigation, never
+        while a run is already going, and never more often than the cooldown —
+        the manoeuvre moves the rover, and a rover that jogs sideways on its own
+        during a demo had better have a good reason each time."""
+        if not (config.TAGS_ENABLED and config.TAGS_PARALLAX_ENABLED
+                and config.TAGS_PARALLAX_AUTO):
+            return
+        if busy or self._parallax_busy or self.rover.is_busy():
+            return
+        if self._nav_thread is not None and self._nav_thread.is_alive():
+            return
+        with self._lock:
+            run = self._degen_run
+        if run < int(config.TAGS_PARALLAX_TRIGGER_N):
+            return
+        if time.time() - self._parallax_t < float(config.TAGS_PARALLAX_COOLDOWN_S):
+            return
+        self._parallax_t = time.time()      # claim the slot before the thread
+        threading.Thread(target=self._parallax_worker, daemon=True).start()
 
     def _monitor_loop(self):
         """Continuously project the detection onto the map (for the UI), and in
@@ -1284,6 +1751,13 @@ class Navigator:
             if time.time() - self._tag_fix_t >= float(config.TAGS_IDLE_FIX_INTERVAL_S):
                 self._tag_fix_t = time.time()
                 self.apply_tag_fix()
+            # Micro-parallax rescue. When the localiser has been refusing on
+            # GEOMETRY for several frames running, no amount of waiting will
+            # help: a single tag column carries no sideways information at all,
+            # so the rover has to go and make some. Only the "degenerate" verdict
+            # triggers this — jogging would achieve nothing if the real problem
+            # were an empty view or an unmapped marker id.
+            self._maybe_parallax(busy)
             if auto and t is not None and not busy:
                 now = t["t"]
                 self._auto_hist = [(ts, x, z) for ts, x, z in self._auto_hist
@@ -1327,7 +1801,9 @@ class Navigator:
             "jog_speed": round(float(self._jog_speed), 3),
             "jog_speed_min": float(config.NAV_JOG_SPEED_MIN),
             "jog_speed_max": float(config.NAV_JOG_SPEED_MAX),
-            "confirm_n": int(config.NAV_TARGET_CONFIRM_N),
+            "avg_n": int(config.NAV_TARGET_AVG_N),
+            "avg_n_min": int(config.NAV_TARGET_AVG_N_MIN),
+            "avg_n_max": int(config.NAV_TARGET_AVG_N_MAX),
         }
 
     def state(self):
@@ -1348,7 +1824,12 @@ class Navigator:
             tag_why = self._tag_reject_reason
             tag_live = self._tag_live
             tag_idle = self._tag_idle
+            tag_pending = dict(self._tag_pending) if self._tag_pending else None
+            tag_parallax = dict(self._tag_parallax) if self._tag_parallax else None
+            parallax_busy = self._parallax_busy
+            degen_run = self._degen_run
             yh = list(self._tag_yaw_hist)
+        tag_window = self._tag_win.summary()
         if tag_last is not None:
             # Age is computed HERE, against the same clock that stamped it. The
             # browser previously did (Date.now()/1000 - t), so any skew between
@@ -1393,6 +1874,16 @@ class Navigator:
             "tag_counts": {"applied": tag_ap, "rejected": tag_rj, "why": tag_why},
             "tag_live": tag_live,
             "tag_idle": tag_idle,
+            # What is currently in the agreement window, and why a correction is
+            # being held back if one is. "n agreeing of m" is the honest answer
+            # to "why hasn't it corrected yet" — far more useful than silence.
+            "tag_window": tag_window,
+            "tag_pending": tag_pending,
+            # Last micro-parallax attempt: the baseline it managed, whether the
+            # pair fused, and what it applied.
+            "tag_parallax": tag_parallax,
+            "parallax_busy": parallax_busy,
+            "degenerate_run": degen_run,
             # Spread of the tag-vs-T265 heading residual. A tight spread near
             # zero means the map agrees with reality; a wide one is the map
             # error showing, and is what forces the yaw gate open.
@@ -1405,7 +1896,7 @@ class Navigator:
             "auto": auto,
             "follow": follow,
             "ignore_obstacles": ignore_obstacles,
-            "confirm_n": int(config.NAV_TARGET_CONFIRM_N),
+            "avg_n": int(config.NAV_TARGET_AVG_N),
             "speed": round(float(self.rover.cfg.MAX_LINEAR), 3),
             # Operator-settable approach distance, so the UI field stays in
             # sync if another client changes it mid-session.
