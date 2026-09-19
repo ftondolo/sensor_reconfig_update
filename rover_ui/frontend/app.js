@@ -9,6 +9,7 @@ const bev = new BevMap($("map-canvas"));
 let autoOn = false;
 let followOn = false;
 let ignoreObstaclesOn = false;
+let overlayOn = false;          // timing overlay on the AUDIENCE views (server-side flag)
 
 // Reflect the configured start cell in the hint text and pre-fill the
 // "Set start position" inputs (mm in the payload -> metres in the UI).
@@ -26,7 +27,7 @@ fetch("/api/map").then((r) => r.json()).then((m) => {
   initSpeed(m);
   initJogSpeed(m);
   initStandoff(m);
-  initConfirmN(m);
+  initAvgN(m);
 });
 
 // --------------------------------------------------------- speed slider
@@ -92,19 +93,22 @@ function initStandoff(m) {
   };
 }
 
-// ------------------------------------------------ ghost-guard confirm count
-// How many consistent detector frames must accumulate before a new/moved
-// target is trusted (Navigator.project_detection). Any whole number 1-10.
-function initConfirmN(m) {
-  const el = $("confirm-n-input");
-  if (m.confirm_n != null) el.value = m.confirm_n;
+// ------------------------------------------------ target running-average window
+// How many of the most recent DETECTION FRAMES the projected target is
+// averaged over (Navigator._update_target_tracking). Frames with no detection
+// don't count. The backend clamps to [avg_n_min, avg_n_max].
+function initAvgN(m) {
+  const el = $("avg-n-input");
+  if (m.avg_n_min != null) el.min = m.avg_n_min;
+  if (m.avg_n_max != null) el.max = m.avg_n_max;
+  if (m.avg_n != null) el.value = m.avg_n;
   el.disabled = false;
-  $("confirm-n-val").textContent = el.value;
+  $("avg-n-val").textContent = el.value;
   el.onchange = async () => {
-    const j = await post("/api/nav/confirm_n", { n: parseInt(el.value, 10) });
-    if (j && j.ok && j.confirm_n != null) {
-      el.value = j.confirm_n;                     // reflect the clamped value
-      $("confirm-n-val").textContent = j.confirm_n;
+    const j = await post("/api/nav/avg_n", { n: parseInt(el.value, 10) });
+    if (j && j.ok && j.avg_n != null) {
+      el.value = j.avg_n;                         // reflect the clamped value
+      $("avg-n-val").textContent = j.avg_n;
     }
   };
 }
@@ -192,6 +196,22 @@ $("btn-ignore-obstacles").onclick = async () => {
   if (j && j.ok) setIgnoreObstacles(j.ignore_obstacles);
 };
 
+// Timing overlay switch: shows frame-received / boxes-computed / live UI
+// timestamps and delays on the audience page's RGB + thermal views. The state
+// lives on the server so it reaches the audience browser; both pages learn it
+// from /ws/telemetry (debug_overlay).
+$("btn-overlay").onclick = async () => {
+  const j = await post("/api/debug/overlay", { enabled: !overlayOn });
+  if (j && j.ok) setOverlay(j.overlay);
+};
+
+function setOverlay(v) {
+  overlayOn = !!v;
+  const b = $("btn-overlay");
+  b.textContent = "⏱ Timing overlay (audience): " + (overlayOn ? "on" : "off");
+  b.className = "btn" + (overlayOn ? " toggle-on" : "");
+}
+
 function setAuto(v) {
   autoOn = !!v;
   const b = $("btn-auto");
@@ -247,9 +267,29 @@ function fmtMM(p) {
   return `(${(p.x / 1000).toFixed(2)}, ${(p.z / 1000).toFixed(2)}) m`;
 }
 
+// FOLLOW blind time / corner-look status (Navigator._corner_check).
+function fmtFollowInfo(f) {
+  if (!f) return "\u2014";
+  const parts = [];
+  if (f.blind_s != null) parts.push(`blind ${f.blind_s.toFixed(1)} s`);
+  const lk = f.look || {};
+  if (lk.state === "looking") parts.push("looking at corner\u2026");
+  else if (lk.state === "timeout") parts.push(`last look: nothing (${lk.look_s} s)`);
+  else if (lk.state === "unchanged") parts.push(`last look: unchanged (${lk.look_s} s)`);
+  else if (lk.state === "replan") parts.push(`last look: re-planned (${lk.look_s} s)`);
+  if (f.corner_replan_pending) parts.push("re-plan at next corner");
+  if (f.plan && f.plan.staircase) parts.push(`staircase plan (${f.plan.legs} legs)`);
+  return parts.length ? parts.join(" \u00b7 ") : "\u2014";
+}
+
 function fmtAccum(a) {
   if (!a || !a.phase || a.phase === "none") return "—";
+  if (a.phase === "averaging") {
+    const sp = a.spread_mm != null ? ` · ±${a.spread_mm} mm` : "";
+    return `${a.n}/${a.need} frames${sp}`;
+  }
   if (a.phase === "accumulating") return `accumulating ${a.n}/${a.need}`;
+  if (a.phase === "confirming") return `far jump: confirming ${a.n}/${a.need}`;
   return "confirmed";
 }
 
@@ -355,6 +395,7 @@ function updateNav(nav) {
     $("nav-tag-geom").textContent = g.length ? g.join(" · ") : "\u2014";
   })();
   $("nav-accum").textContent = fmtAccum(nav.accum);
+  $("nav-follow-info").textContent = fmtFollowInfo(nav.follow ? nav.follow_info : null);
   const sEl = $("standoff-input");
   if (nav.standoff_mm != null && sEl && document.activeElement !== sEl) {
     sEl.value = nav.standoff_mm;                  // another client may have changed it
@@ -399,6 +440,9 @@ function connectWS() {
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.nav) updateNav(msg.nav);
+    if (typeof msg.debug_overlay === "boolean" && msg.debug_overlay !== overlayOn) {
+      setOverlay(msg.debug_overlay);
+    }
     if (msg.status && msg.status.sensors && msg.status.sensors.detector) {
       setBadge("st-detector", msg.status.sensors.detector.status);
     }
