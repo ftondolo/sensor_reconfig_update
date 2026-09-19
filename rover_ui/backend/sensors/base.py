@@ -20,18 +20,38 @@ class LatestValue:
 
     def __init__(self):
         self._value: Optional[Any] = None
+        self._meta: Optional[dict] = None
         self._seq = 0
         self._cond = threading.Condition()
 
-    def set(self, value: Any) -> None:
+    def set(self, value: Any, meta: Optional[dict] = None) -> None:
+        """Publish a value. ``meta`` is optional per-value metadata (e.g.
+        timing stamps) that is replaced together with the value, so a reader
+        of get_meta() always gets the metadata of THAT value."""
         with self._cond:
             self._value = value
+            self._meta = meta
             self._seq += 1
             self._cond.notify_all()
 
     def get(self):
         with self._cond:
             return self._value, self._seq
+
+    def get_meta(self):
+        """Like get(), plus the value's metadata: (value, seq, meta)."""
+        with self._cond:
+            return self._value, self._seq, self._meta
+
+    def wait_for_next_meta(self, last_seq: int, timeout: float = 1.0):
+        """wait_for_next() that also returns the value's metadata:
+        (value, seq, meta), or (None, last_seq, None) on timeout."""
+        with self._cond:
+            if self._seq <= last_seq:
+                self._cond.wait(timeout)
+            if self._seq <= last_seq:
+                return None, last_seq, None
+            return self._value, self._seq, self._meta
 
     def wait_for_next(self, last_seq: int, timeout: float = 1.0):
         """Block until a value newer than ``last_seq`` is available.
