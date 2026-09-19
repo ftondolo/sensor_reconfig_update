@@ -278,3 +278,15 @@ html, body {
 .hint { font-size: 11.5px; color: var(--muted); line-height: 1.5; margin: 8px 0 0; }
 .op-thumb { border-top: 1px solid var(--border); }
 .op-thumb img { width: 100%; display: block; }
+
+/* ---------- timing overlay (debug; toggled from the operator page) ---------- */
+.cam-body { position: relative; }
+.timing-ovl {
+  position: absolute; left: 8px; top: 8px; z-index: 2;
+  padding: 5px 8px; border-radius: 6px;
+  max-width: calc(100% - 16px); overflow: hidden;
+  background: rgba(0, 0, 0, .66); color: #e6edf3;
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre; pointer-events: none;
+}
+.timing-ovl[hidden] { display: none; }
