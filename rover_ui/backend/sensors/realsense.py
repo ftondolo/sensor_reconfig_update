@@ -164,11 +164,12 @@ class D435iRGB(SensorThread):
 
     def read_once(self):
         frames = self._pipe.wait_for_frames(2000)
+        t_rx = time.time()                      # host time the frame was received
         color = frames.get_color_frame()
         if not color:
             return None
         img = np.asanyarray(color.get_data())
-        self.raw.set(img)                       # RGB published immediately (fast)
+        self.raw.set(img, meta={"t_rx": t_rx})  # RGB published immediately (fast)
         if self._depth_enabled:
             depth = frames.get_depth_frame()
             if depth:
@@ -191,7 +192,7 @@ class D435iRGB(SensorThread):
         cv2.rectangle(img, (cx - 40, cy - 90), (cx + 40, cy + 90), (0, 180, 255), -1)
         cv2.putText(img, "D435i MOCK", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                     0.8, (255, 255, 255), 2)
-        self.raw.set(img)
+        self.raw.set(img, meta={"t_rx": time.time()})
         if self._depth_enabled:
             # Synthetic depth: nearer (warm) at the drifting subject, far elsewhere.
             yy, xx = np.mgrid[0:h, 0:w]
