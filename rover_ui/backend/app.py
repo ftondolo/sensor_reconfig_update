@@ -28,13 +28,20 @@ Endpoints:
                                     overlaps an obstacle/clearance zone (start/continue)
   POST /api/nav/speed          -> {mps} set the navigation speed cap (clamped)
   POST /api/nav/jog_speed      -> {mps} set the Drive-pad hold-to-move speed
-  POST /api/nav/confirm_n      -> {n} set the ghost-guard confirm-count (1-10, clamped)
+  POST /api/nav/avg_n          -> {n} set the target running-average window, in detection frames (clamped)
   POST /api/nav/standoff       -> {mm} set the target approach distance (clamped)
   POST /api/nav/reset_pose     -> {x?, z?} anchor the current pose to a map cell
   POST /api/nav/nudge          -> {axis, mm} small open-map setup move
+  GET  /stream/detect_ts|detect_thermal_ts -> MJPEG + per-frame timing headers
+                                    (X-Frame-T, X-Box-T, X-Box-Src-T, X-Render-T,
+                                    X-Send-T; rover wall-clock seconds)
+  GET  /api/time               -> {t} rover wall clock (browser clock-offset sync)
+  POST /api/debug/overlay      -> {enabled} show/hide the timing overlay on the
+                                    audience RGB + thermal views (operator switch)
 """
 import asyncio
 import os
+import time
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -113,6 +120,40 @@ def _mjpeg_response(buffer):
     )
 
 
+def _mjpeg_ts_generator(buffer):
+    """MJPEG stream whose parts also carry the frame's timing metadata as
+    headers. Only the audience timing overlay reads these streams (via
+    fetch, see audience.js); the plain /stream/* endpoints are unchanged."""
+    boundary = b"--frame"
+    last_seq = -1
+
+    def _h(name, v):
+        return (b"%s: %.6f\r\n" % (name, v)) if isinstance(v, (int, float)) else b""
+    while True:
+        frame, seq, meta = buffer.wait_for_next_meta(last_seq, timeout=1.0)
+        if frame is None:
+            continue
+        last_seq = seq
+        meta = meta or {}
+        yield (boundary + b"\r\n"
+               b"Content-Type: image/jpeg\r\n"
+               + _h(b"X-Frame-T", meta.get("t_frame"))
+               + _h(b"X-Box-T", meta.get("t_box"))
+               + _h(b"X-Box-Src-T", meta.get("t_box_src"))
+               + _h(b"X-Render-T", meta.get("t_render"))
+               + _h(b"X-Send-T", time.time())
+               + b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n"
+               + frame + b"\r\n")
+
+
+def _mjpeg_ts_response(buffer):
+    return StreamingResponse(
+        _mjpeg_ts_generator(buffer),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/stream/flir")
 def stream_flir():
     return _mjpeg_response(sensors["flir_thermal"].latest)
@@ -136,6 +177,39 @@ def stream_detect():
 @app.get("/stream/detect_thermal")
 def stream_detect_thermal():
     return _mjpeg_response(detector.latest_thermal)
+
+
+@app.get("/stream/detect_ts")
+def stream_detect_ts():
+    return _mjpeg_ts_response(detector.latest)
+
+
+@app.get("/stream/detect_thermal_ts")
+def stream_detect_thermal_ts():
+    return _mjpeg_ts_response(detector.latest_thermal)
+
+
+# ---- timing overlay (operator switch -> audience views) ------------------
+# Server-side so the operator page's switch reaches the audience page, which
+# is usually open in a different browser. Pushed to both over /ws/telemetry.
+_debug = {"overlay": False}
+
+
+class OverlayBody(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/time")
+def api_time():
+    """Rover wall clock, for the browser's clock-offset estimate (the audience
+    overlay converts rover timestamps to browser time with it)."""
+    return {"t": time.time()}
+
+
+@app.post("/api/debug/overlay")
+def debug_overlay(body: OverlayBody):
+    _debug["overlay"] = bool(body.enabled)
+    return {"ok": True, "overlay": _debug["overlay"]}
 
 
 @app.get("/stream/detect_depth")
@@ -183,6 +257,7 @@ async def ws_telemetry(ws: WebSocket):
             if nav is not None:
                 payload["nav"] = nav.state()
             payload["status"] = _full_status()
+            payload["debug_overlay"] = _debug["overlay"]
             await ws.send_json(payload)
             await asyncio.sleep(0.066)  # ~15 Hz: nav/map data is low-rate
     except WebSocketDisconnect:
@@ -240,7 +315,7 @@ class StandoffBody(BaseModel):
     mm: float
 
 
-class ConfirmNBody(BaseModel):
+class AvgNBody(BaseModel):
     n: int
 
 
@@ -339,14 +414,15 @@ def nav_jog_speed(body: JogSpeedBody):
     return {"ok": True, "jog_speed": applied}
 
 
-@app.post("/api/nav/confirm_n")
-def nav_confirm_n(body: ConfirmNBody):
-    """Set how many mutually-consistent detector frames (1-10, clamped) must
-    accumulate before a new/relocated detection target is trusted (the
-    ghost-detection guard in Navigator.project_detection). Takes effect on
-    the very next detection, no restart needed."""
-    applied = nav.set_confirm_n(body.n)
-    return {"ok": True, "confirm_n": applied, "nav": nav.state()}
+@app.post("/api/nav/avg_n")
+def nav_avg_n(body: AvgNBody):
+    """Set the target running-average window: how many of the most recent
+    DETECTION FRAMES (frames that actually contain a detection) the projected
+    target averages over (Navigator._update_target_tracking). Clamped to
+    [NAV_TARGET_AVG_N_MIN, NAV_TARGET_AVG_N_MAX]. Takes effect on the next
+    detection frame, no restart needed."""
+    applied = nav.set_avg_n(body.n)
+    return {"ok": True, "avg_n": applied, "nav": nav.state()}
 
 
 @app.post("/api/nav/standoff")
