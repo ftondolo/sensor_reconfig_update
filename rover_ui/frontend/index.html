@@ -35,7 +35,8 @@
           <span>drift <b id="nav-drift">—</b></span>
           <span>tags <b id="nav-tags">—</b></span>
           <span>tag geometry <b id="nav-tag-geom">—</b></span>
-          <span>accumulation <b id="nav-accum">—</b></span>
+          <span>target avg <b id="nav-accum">—</b></span>
+          <span>follow <b id="nav-follow-info">—</b></span>
           <span>msg <b id="nav-msg-strip">—</b></span>
         </div>
       </div>
@@ -77,8 +78,8 @@
           <span class="dim" id="standoff-range">—</span>
         </div>
         <div class="speed-row">
-          <label for="confirm-n-input">Confirm-N <b id="confirm-n-val">—</b></label>
-          <input type="number" id="confirm-n-input" min="1" max="10" step="1"
+          <label for="avg-n-input">Avg window N <b id="avg-n-val">—</b></label>
+          <input type="number" id="avg-n-input" min="1" max="20" step="1"
                  style="width:56px" disabled />
         </div>
         <p class="hint">
@@ -88,9 +89,12 @@
           <b>Follow</b> tracks the live target continuously and re-plans the
           moment it moves, overriding the navigation in progress.
           <b>Speed</b> caps the drive speed (applies live, even mid-move).
-          <b>Confirm-N</b> is how many consistent detections in a row are
-          needed before a new/moved target is trusted (higher = steadier but
-          slower to react; 1-10).
+          <b>Avg window N</b> is how many of the most recent frames that
+          contain a detection the target position is averaged over (frames
+          with no detection don't count). A one-frame false detection is
+          ignored; a real move is followed after about N/2+1 detections.
+          Higher = steadier but slower to react; below 3 gives little
+          protection against false detections.
           Clicking the map navigates to a manual target instead.
         </p>
       </div>
@@ -158,12 +162,16 @@
 
       <div class="card grow op-thumb-card">
         <h3>Detection <span id="st-detector" class="badge">—</span></h3>
+        <div class="btn-row">
+          <button id="btn-overlay" class="btn"
+                  title="Show frame / box / live timestamps and delays on the audience RGB + thermal views">⏱ Timing overlay (audience): off</button>
+        </div>
         <div class="op-thumb"><img id="detect-img" alt="detection stream" /></div>
       </div>
     </aside>
   </main>
 
   <script src="/static/map_view.js?v=demo8"></script>
-  <script src="/static/app.js?v=demo18"></script>
+  <script src="/static/app.js?v=demo21"></script>
 </body>
 </html>
