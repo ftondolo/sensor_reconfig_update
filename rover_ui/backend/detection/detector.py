@@ -145,6 +145,11 @@ class DetectorThread(SensorThread):
         self._clahe = None            # fallback thermal enhancement (set in open())
         self._thermal_pre = None      # FLIROneProPreprocessor (set in open())
         self._therm_disp = None       # cached preprocessed thermal for the panel
+        self._therm_disp_t = None     # receive time of the thermal frame behind it
+        # Timing of the latest detection pass, for the timing overlay:
+        # {t_box: when boxes were ready, src_rgb_t / src_therm_t: receive time
+        #  of the frames that pass ran on}. Written with _disp_dets.
+        self._box_meta = None
         self._render_i = 0            # render-loop counter (throttles side panels)
         # Smoothed single target (prevents teleport across vision<->radar handoff).
         self._sm = None               # {cx, cy, bw, bh, range, score, contrib, radar, t}
@@ -341,8 +346,10 @@ class DetectorThread(SensorThread):
         # Runs the heavy models as fast as they go and feeds the tracker. We
         # return None so the SensorThread base does NOT publish at detection
         # rate — _render_loop publishes self.latest at ~30 fps instead.
-        rgb, _ = self._rgb_sensor.raw.get()
-        therm_gray, _ = self._thermal_sensor.raw.get()
+        rgb, _, rgb_meta = self._rgb_sensor.raw.get_meta()
+        therm_gray, _, therm_meta = self._thermal_sensor.raw.get_meta()
+        rgb_t = (rgb_meta or {}).get("t_rx")
+        therm_t = (therm_meta or {}).get("t_rx")
         if rgb is None or therm_gray is None:
             time.sleep(0.01)
             return None
@@ -376,6 +383,7 @@ class DetectorThread(SensorThread):
             # weak FLIR feed gets its best chance); boxes already in RGB coords.
             therm_in = self._preprocess_thermal(therm_bgr) if config.DETECT_THERMAL_ENHANCE else therm_bgr
             self._therm_disp = therm_in          # cache for the panel (avoid recompute)
+            self._therm_disp_t = therm_t
             td = self._therm_yolo.predict(therm_in, verbose=False, conf=config.DETECT_THERMAL_CONF, iou=0.5, classes=[0])
             therm_boxes = td[0].boxes.xyxy.cpu().numpy() if len(td[0].boxes) > 0 else np.zeros((0, 4))
             therm_scores = td[0].boxes.conf.cpu().numpy() if len(td[0].boxes) > 0 else np.zeros(0)
@@ -412,6 +420,11 @@ class DetectorThread(SensorThread):
         # stationary again and a MOVING cluster is freshly acquired. Static
         # returns are filtered in software (|v| < RADAR_MIN_POINT_V) on top of
         # the hardware clutterRemoval enabled in the chirp cfg.
+        # radar_fresh: did THIS frame carry a fresh radar measurement of the
+        # target (a cluster actually associated this update), as opposed to the
+        # tracker merely holding its last lock through a dropout? Only fresh
+        # frames count toward the navigator's running-average window.
+        radar_fresh = False
         if self._radar_sensor is not None:
             rv, rseq = self._radar_sensor.latest.get()
             if rv is not None and rseq != self._rlast_seq:
@@ -432,6 +445,7 @@ class DetectorThread(SensorThread):
                     self._radar_tracker.update(pts, now_r, rover_moving=False)
                     self._radar_last_t = now_r
                     tgt = self._radar_tracker.target()
+                    radar_fresh = bool(tgt) and tgt.get("t") == now_r
                     with self._rlock:
                         self._rinfo = ({"range": tgt["range"], "az": tgt["az"],
                                         "conf": 0.9 if tgt["moving"] else 0.7,
@@ -440,6 +454,7 @@ class DetectorThread(SensorThread):
                 elif self._radar_eval is not None:
                     self._radar_last_t = time.time()
                     self._ingest_radar(pts)
+                    radar_fresh = bool(getattr(self, "_rfresh", False))
         rinfo = self._get_rinfo() if self._radar_sensor is not None else None
         radar_only = (len(boxes) == 0 and rinfo is not None)
 
@@ -472,9 +487,16 @@ class DetectorThread(SensorThread):
         sdet = self._smooth_target(raw_dets[0] if raw_dets else None, w, h, now)
         dets = [sdet] if sdet else []
         target = self._target_from_det(sdet, w)
+        if target is not None:
+            # Per-frame (UNSMOOTHED) measurement + a freshness flag for the
+            # navigator's running average, which counts DETECTION FRAMES only.
+            # The smoothed az/range above stay as they are for display.
+            target.update(self._raw_measurement(raw_dets, boxes, rinfo, radar_fresh, w))
         with self._slock:
             self._disp_dets = dets
             self._disp_target = target
+            self._box_meta = {"t_box": time.time(), "src_rgb_t": rgb_t,
+                              "src_therm_t": therm_t}
         tel = self._telemetry(dets, settings, w, h, mock=False)
         tel["target"] = target
         tel["radar_snr"] = ({"peak": rinfo.get("snr_peak"), "sum": rinfo.get("snr_sum")}
@@ -551,19 +573,21 @@ class DetectorThread(SensorThread):
         last = None
         while not self._render_stop.is_set() and not self._stop.is_set():
             t_start = time.time()
-            rgb, _ = self._rgb_sensor.raw.get()
+            rgb, _, rgb_meta = self._rgb_sensor.raw.get_meta()
             if rgb is None or self._tracker is None:
                 self._render_stop.wait(0.02); continue
             with self._slock:
                 settings = self._last_settings
                 dets = self._disp_dets          # smoothed single det (read_once owns it)
                 tgt = self._disp_target
+                bm = dict(self._box_meta) if self._box_meta else {}
             if settings is None:
                 self._render_stop.wait(0.02); continue
             rgb = np.ascontiguousarray(rgb)
             h, w = rgb.shape[:2]
             try:
-                self.latest.set(self._render(rgb, dets, settings, mock=False, tgt=tgt))
+                self.latest.set(self._render(rgb, dets, settings, mock=False, tgt=tgt),
+                                meta=self._frame_meta((rgb_meta or {}).get("t_rx"), bm, "src_rgb_t"))
             except Exception:
                 self._render_stop.wait(0.02); continue
             # Side panels (thermal + depth) are secondary -> ~10 fps, and reuse
@@ -571,9 +595,10 @@ class DetectorThread(SensorThread):
             self._render_i += 1
             if self._render_i % 3 == 0:
                 try:
-                    tb = self._therm_disp
+                    tb, tb_t = self._therm_disp, self._therm_disp_t
                     if tb is None:
-                        tv, _ = self._thermal_sensor.raw.get()
+                        tv, _, tmeta = self._thermal_sensor.raw.get_meta()
+                        tb_t = (tmeta or {}).get("t_rx")
                         tb = cv2.cvtColor(tv, cv2.COLOR_GRAY2BGR) if (tv is not None and tv.ndim == 2) else tv
                     if tb is not None:
                         tb = tb.copy()
@@ -582,7 +607,8 @@ class DetectorThread(SensorThread):
                         if config.DETECT_SHOW_RES:
                             tb = self._degrade(tb, self._debounced_scale(
                                 "therm", settings.get("therm_scale", 1.0), time.time()))
-                        self.latest_thermal.set(self._encode_panel(tb, dets, "THERMAL"))
+                        self.latest_thermal.set(self._encode_panel(tb, dets, "THERMAL"),
+                                                meta=self._frame_meta(tb_t, bm, "src_therm_t"))
                 except Exception:
                     pass
                 try:
@@ -613,7 +639,7 @@ class DetectorThread(SensorThread):
             self._mock_t0 = time.time()
         t = time.time() - self._mock_t0
 
-        rgb, _ = self._rgb_sensor.raw.get()
+        rgb, _, rgb_meta = self._rgb_sensor.raw.get_meta()
         if rgb is None:
             rgb = np.full((config.D435_HEIGHT, config.D435_WIDTH, 3), 30, dtype="uint8")
             cv2.putText(rgb, "no RGB frame", (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
@@ -641,9 +667,27 @@ class DetectorThread(SensorThread):
         self._fps = config.DETECT_FPS
 
         dets = self._build_dets(box, score, contribs)
+        bm = {"t_box": time.time(), "src_rgb_t": (rgb_meta or {}).get("t_rx")}
         jpeg = self._render(rgb, dets, settings, mock=True)
         self.telemetry.set(self._telemetry(dets, settings, w, h, mock=True))
-        return jpeg
+        # Publish here (with timing metadata) and return None so the base
+        # class doesn't re-publish the same frame without it.
+        self.latest.set(jpeg, meta=self._frame_meta(bm["src_rgb_t"], bm, "src_rgb_t"))
+        # Mock thermal panel from the mock FLIR frame, so the thermal view (and
+        # its timing overlay) also works in mock preview.
+        try:
+            tv, _, tmeta = self._thermal_sensor.raw.get_meta()
+            if tv is not None:
+                tb = cv2.applyColorMap(tv, cv2.COLORMAP_INFERNO) if tv.ndim == 2 else tv.copy()
+                if tb.shape[:2] != (h, w):
+                    tb = cv2.resize(tb, (w, h))
+                t_rx = (tmeta or {}).get("t_rx")
+                self.latest_thermal.set(self._encode_panel(tb, dets, "THERMAL"),
+                                        meta=self._frame_meta(t_rx, dict(bm, src_therm_t=t_rx),
+                                                              "src_therm_t"))
+        except Exception:
+            pass
+        return None
 
     # ---- shared helpers ------------------------------------------------
     def _build_dets(self, boxes, scores, contribs):
@@ -763,6 +807,20 @@ class DetectorThread(SensorThread):
             raise RuntimeError("detector JPEG encode failed")
         return buf.tobytes()
 
+    @staticmethod
+    def _frame_meta(t_frame, box_meta, src_key):
+        """Timing metadata published with each rendered frame (served on the
+        /stream/*_ts endpoints for the audience timing overlay). All times are
+        rover wall-clock seconds (time.time()):
+          t_frame     when the displayed camera frame was received/decoded
+          t_box       when the boxes drawn on it were computed
+          t_box_src   receive time of the frame those boxes were computed from
+          t_render    when this frame was rendered/encoded for streaming"""
+        return {"t_frame": t_frame,
+                "t_box": (box_meta or {}).get("t_box"),
+                "t_box_src": (box_meta or {}).get(src_key),
+                "t_render": time.time()}
+
     def _encode_panel(self, img, dets, tag):
         """Boxes (no contrib labels) + a corner tag, for the thermal/depth panels."""
         self._draw_boxes(img, dets, labels=False)
@@ -819,6 +877,7 @@ class DetectorThread(SensorThread):
     def _ingest_radar(self, points):
         c = self._rcfg
         qual, best, _ = self._radar_eval(points, c)
+        self._rfresh = best is not None       # fresh cluster this frame (see read_once)
         if best is not None:
             self._rlast_best = best
         self._rwin.append(qual)
@@ -1030,6 +1089,43 @@ class DetectorThread(SensorThread):
                         round(cx + bw / 2, 1), round(cy + bh / 2, 1)],
                 "score": round(float(s["score"]), 3), "contrib": s["contrib"],
                 "radar": s["radar"]}
+
+    @staticmethod
+    def _iou(a, b):
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+        return inter / ua if ua > 0 else 0.0
+
+    def _raw_measurement(self, raw_dets, boxes, rinfo, radar_fresh, w):
+        """Unsmoothed measurement of THIS frame's selected detection, plus
+        whether it is a genuine detection this frame:
+
+          fresh      vision: the selected (tracker) box overlaps a box the
+                     model actually produced THIS frame (IoU >= 0.5) -- not a
+                     tracker prediction coasting through a miss.
+                     radar:  the radar tracker associated a cluster this frame
+                     (not a hold through a dropout).
+                     No selected detection (the smoothed target is coasting,
+                     TARGET_COAST) -> False.
+          raw_az     bearing (deg, camera frame) of the selected box centre
+          raw_range  this frame's range (m) for that detection
+          snr_peak   radar reflection strength (radar detections only)"""
+        out = {"fresh": False, "raw_az": None, "raw_range": None, "snr_peak": None}
+        if not raw_dets:
+            return out
+        rd = raw_dets[0]
+        bx = rd["box"]
+        out["raw_az"] = round(((bx[0] + bx[2]) / 2.0 / w - 0.5) * float(config.DETECT_RGB_HFOV), 2)
+        out["raw_range"] = rd.get("range")
+        if rd.get("radar"):
+            out["fresh"] = bool(radar_fresh)
+            out["snr_peak"] = rinfo.get("snr_peak") if rinfo else None
+        else:
+            out["fresh"] = any(self._iou(bx, [float(v) for v in b[:4]]) >= 0.5
+                               for b in boxes)
+        return out
 
     def _target_from_det(self, sdet, w):
         """Control target {x, az, range, source} from the smoothed det center."""
