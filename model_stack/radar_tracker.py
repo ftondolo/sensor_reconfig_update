@@ -235,6 +235,9 @@ class RadarTracker:
             "az": math.degrees(math.atan2(self.x, self.y)),   # 0 = ahead, + = right
             "moving": self._moving,
             "snr_peak": self._snr_peak, "snr_sum": self._snr_sum,
+            # time of the last cluster actually associated to the lock; equals
+            # the current update's t only when this frame was a fresh hit
+            "t": self.t,
         }
 
     def reset(self):
