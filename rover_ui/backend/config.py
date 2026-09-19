@@ -89,7 +89,9 @@ NAV_ADJUST_STEP_MM = _env("NAV_ADJUST_STEP_MM", 100)
 NAV_ADJUST_MAX_MM = _env("NAV_ADJUST_MAX_MM", 2500)
 # Skip a re-navigation if the new goal is within this distance of where the
 # rover already is / is already heading (don't twitch on detection jitter).
-NAV_GOAL_TOLERANCE_MM = _env("NAV_GOAL_TOLERANCE_MM", 250)
+# Raised 250 -> 350 (2026-09-18): re-dispatching for a goal only ~250 mm away
+# re-planned on target jitter and made the rover shuttle back and forth.
+NAV_GOAL_TOLERANCE_MM = _env("NAV_GOAL_TOLERANCE_MM", 350)
 # AUTO mode: re-navigate whenever a (stable) detection target appears. The
 # target's projected map position must hold within NAV_AUTO_STABLE_MM for
 # NAV_AUTO_STABLE_S seconds before a move is dispatched.
@@ -106,7 +108,7 @@ NAV_AUTO_COOLDOWN_S = _env("NAV_AUTO_COOLDOWN_S", 2.0)
 # Mutually exclusive with AUTO. When there's nothing to drive (already at the
 # goal / no target), it idles NAV_FOLLOW_MIN_INTERVAL_S before re-checking.
 NAV_FOLLOW = _env("NAV_FOLLOW", False)
-NAV_FOLLOW_CYCLE_S = _env("NAV_FOLLOW_CYCLE_S", 20.0)      # stuck-backstop only
+NAV_FOLLOW_CYCLE_S = _env("NAV_FOLLOW_CYCLE_S", 20.0)      # re-plan at next corner after this; hard cancel at 2x
 NAV_FOLLOW_MIN_INTERVAL_S = _env("NAV_FOLLOW_MIN_INTERVAL_S", 1.0)
 NAV_FOLLOW_REPLAN_MM = _env("NAV_FOLLOW_REPLAN_MM", 500)   # re-plan when target moves this far (mm)
 # Receding-horizon refinement of the above: a target that crosses from one side
@@ -122,44 +124,83 @@ NAV_FOLLOW_SIDE_SWITCH_MM = _env("NAV_FOLLOW_SIDE_SWITCH_MM", 300)
 # settle). Raise if the rover commits to a radar target before it has truly
 # stopped; lower for snappier hops. (Vision targets are not gated by this.)
 NAV_FOLLOW_STILL_CONFIRM_S = _env("NAV_FOLLOW_STILL_CONFIRM_S", 0.5)
+# ---- FOLLOW: blind-time limit + corner look (added 2026-09-19) -------------
+# While the rover drives, radar is switched off by the detector (ego-motion), so
+# on a long path a radar-only target goes unseen until arrival. FOLLOW now uses
+# the CORNERS of the plan (where the rover stops anyway) to look again:
+#   * blind time = seconds since the last accepted detection, from ANY sensor;
+#   * at a corner, look when blind >= NAV_FOLLOW_BLIND_S, or when it would pass
+#     that limit by the end of the next leg (bounds the worst case to ~1 leg);
+#   * skip the look when less than NAV_FOLLOW_LOOK_MIN_REMAIN_MM of path is left
+#     (the normal look on arrival covers it);
+#   * a look waits for a fresh detection and ends as soon as one arrives (vision:
+#     almost at once; radar: ~1.5 s to re-lock), capped at NAV_FOLLOW_LOOK_MAX_S.
+NAV_FOLLOW_BLIND_S = _env("NAV_FOLLOW_BLIND_S", 4.0)
+NAV_FOLLOW_LOOK_MAX_S = _env("NAV_FOLLOW_LOOK_MAX_S", 2.0)
+NAV_FOLLOW_LOOK_MIN_REMAIN_MM = _env("NAV_FOLLOW_LOOK_MIN_REMAIN_MM", 800)
+# After a look, re-plan ONLY when needed: the new standoff goal is more than
+# NAV_GOAL_TOLERANCE_MM from the current one, the target moved at least
+# NAV_FOLLOW_REPLAN_MM, or it crossed sides. Never twice within this interval.
+NAV_FOLLOW_REPLAN_MIN_INTERVAL_S = _env("NAV_FOLLOW_REPLAN_MIN_INTERVAL_S", 2.0)
+# Mid-leg re-planning. A target move >= NAV_FOLLOW_REPLAN_MM seen WHILE driving
+# is now deferred to the next corner (no stop mid-straight). Only a side switch
+# or a move this large still stops the rover mid-leg. Set equal to
+# NAV_FOLLOW_REPLAN_MM to restore the old always-immediate behaviour.
+NAV_FOLLOW_MIDLEG_REPLAN_MM = _env("NAV_FOLLOW_MIDLEG_REPLAN_MM", 1500)
+# More corners in FOLLOW (without extra distance). The planner always picks
+# the fewest-turn path, so lowering turn_penalty doesn't add corners on a grid.
+# Instead, each L-shaped pair of legs with a leg longer than
+# NAV_FOLLOW_MAX_LEG_MM is re-cut into an equal-length staircase with a corner
+# about every MAX_LEG, used only if it keeps the clearance the original route
+# achieved. Steps are never shorter than NAV_FOLLOW_MIN_STEP_MM. A single long
+# straight leg is left alone. Set MAX_LEG to 0 to disable.
+NAV_FOLLOW_MAX_LEG_MM = _env("NAV_FOLLOW_MAX_LEG_MM", 1500)
+NAV_FOLLOW_MIN_STEP_MM = _env("NAV_FOLLOW_MIN_STEP_MM", 250)
+# Last known position (prior). When the averaging window is emptied (a corner
+# look, or NAV_TARGET_FORGET_S without detections) the last estimate is kept.
+# A new detection within R0 + SPEED x (time since last seen), capped at MAX, is
+# accepted from one frame; one further away could be a ghost and needs
+# NAV_TARGET_PRIOR_CONFIRM_N consistent frames first.
+NAV_TARGET_PRIOR_R0_MM = _env("NAV_TARGET_PRIOR_R0_MM", 300.0)
+NAV_TARGET_PRIOR_SPEED_MM_S = _env("NAV_TARGET_PRIOR_SPEED_MM_S", 1000.0)
+NAV_TARGET_PRIOR_MAX_MM = _env("NAV_TARGET_PRIOR_MAX_MM", 4000.0)
+NAV_TARGET_PRIOR_CONFIRM_N = _env("NAV_TARGET_PRIOR_CONFIRM_N", 2)
 # How long a projected detection target stays shown on the map after the
 # detection drops (purely cosmetic; navigation uses the live value).
 NAV_TARGET_HOLD_S = _env("NAV_TARGET_HOLD_S", 1.5)
-# Anti-jump window: the projected map target is the MEDIAN of all raw
-# projections within this window, so a brief wrong detection (an outlier that
-# corrects itself) can't jump the target — it is out-voted by the window. Larger
-# = steadier but laggier; smaller = more responsive but jumpier.
-NAV_TARGET_WINDOW_S = _env("NAV_TARGET_WINDOW_S", 0.2)
-# The stateful target tracker (the median window above, the continuity gate,
-# and the ghost-guard confirmation run) used to be re-run independently by
-# both _monitor_loop (every 0.2 s) and _follow_loop (every 0.1 s while
-# moving), duplicating its work and padding the window with near-duplicate
-# samples. It now runs on this one dedicated cadence in a single place
-# (Navigator._track_loop); every reader (both loops, the UI) just reads the
-# cached result via project_detection(). Lower this to track faster without
-# touching the tracker's own semantics -- it does not need to match either
-# loop's polling interval.
-NAV_TRACK_UPDATE_S = _env("NAV_TRACK_UPDATE_S", 0.1)
-# Anti-teleport continuity gate (on top of the median window). Once a target is
-# locked, a projected detection that lands more than NAV_TARGET_JUMP_MM from the
-# current track is DROPPED (the track holds its place), so a spurious detection
-# or a target lost-and-refound elsewhere cannot teleport the marker. A far
-# detection only re-locks after it persists NAV_TARGET_RELOCK_S (the person
-# really walked there), or after the track goes stale with no accepted update for
-# NAV_TARGET_FORGET_S (a long loss -> allow a fresh lock anywhere).
+# ---- target running average (replaces the Confirm-N ghost guard) ----------
+# The projected map target is a ROBUST RUNNING AVERAGE over the last
+# NAV_TARGET_AVG_N DETECTION FRAMES -- only detector frames that carry a FRESH
+# detection count (see detector.py target["fresh"]); frames with no detection,
+# or where the detector is merely coasting/holding an old box or radar lock,
+# do not advance the window. The window always ends at the current detection
+# frame and uses however many frames exist (1..N), so it never waits to fill.
+#
+# Ghost handling is by WEIGHTING, not by a hard block: the centre is the medoid
+# of the window (the sample closest to all others; ties -> newest), samples
+# within NAV_TARGET_INLIER_MM of it count fully, the weight tapers to zero at
+# NAV_TARGET_JUMP_MM. A one-frame ghost therefore has no effect; a real move is
+# followed once it holds the majority of the window (~N/2+1 detection frames).
+# Operator-settable at runtime via the UI (Navigator.set_avg_n), clamped to
+# [NAV_TARGET_AVG_N_MIN, NAV_TARGET_AVG_N_MAX]. Below 3 there is little ghost
+# rejection left.
+NAV_TARGET_AVG_N = _env("NAV_TARGET_AVG_N", 5)
+NAV_TARGET_AVG_N_MIN = _env("NAV_TARGET_AVG_N_MIN", 1)
+NAV_TARGET_AVG_N_MAX = _env("NAV_TARGET_AVG_N_MAX", 20)
+NAV_TARGET_INLIER_MM = _env("NAV_TARGET_INLIER_MM", 250)
+# Beyond this distance from the window centre a sample gets zero weight.
 NAV_TARGET_JUMP_MM = _env("NAV_TARGET_JUMP_MM", 700)
-NAV_TARGET_RELOCK_S = _env("NAV_TARGET_RELOCK_S", 2.5)
+# Detection frames only advance the window when they arrive, so after a long
+# loss the window could hold a position the person has long left. If the newest
+# sample is older than this, the window is cleared and the next detection
+# starts a fresh lock.
 NAV_TARGET_FORGET_S = _env("NAV_TARGET_FORGET_S", 5.0)
-# Ghost guard (navigator.project_detection): how many DISTINCT, mutually
-# consistent detector frames must accumulate before a new or relocated target
-# is committed. 1 restores the old single-frame behaviour. Operator-settable
-# at runtime via Navigator.set_confirm_n(), which clamps to [1, 10].
-NAV_TARGET_CONFIRM_N = _env("NAV_TARGET_CONFIRM_N", 3)
-# Companion to the above, for mmWave targets only: two reflected-intensity
-# (SNR) readings count as "the same reflector" when they differ by no more than
-# this FRACTION of the larger one. Loose on purpose — real returns fluctuate
-# frame to frame, and a vision target has no SNR at all (comparison is skipped).
-NAV_TARGET_SNR_TOL = _env("NAV_TARGET_SNR_TOL", 0.5)
+# How often the tracker polls the detector for a new frame (Navigator._track_loop).
+# Faster than the detector frame rate so no detection frame is missed; repeated
+# polls of the same frame are ignored.
+NAV_TRACK_UPDATE_S = _env("NAV_TRACK_UPDATE_S", 0.05)
+# Removed 2026-09-18 with the running average: NAV_TARGET_WINDOW_S (median
+# window), NAV_TARGET_RELOCK_S, NAV_TARGET_CONFIRM_N, NAV_TARGET_SNR_TOL.
 # Emergency stop: while moving, if the rover footprint (car half-extent + this
 # margin) overlaps a RAW obstacle, cancel the move and stop immediately.
 #
@@ -214,7 +255,11 @@ NAV_RAMP_STEP = _env("NAV_RAMP_STEP", 0.05)
 # Lowered 0.12 -> 0.06 to suit the tighter POS_TOL; the stiction integral below
 # (LIN_IGAIN/LIN_I_MAX) restores breakaway authority on demand, which is what
 # the old high floor was crudely providing all the time.
-NAV_MIN_LINEAR = _env("NAV_MIN_LINEAR", 0.06)
+# Lowered 0.06 -> 0.045 (2026-09-18): a slower final approach keeps the
+# stopping distance well inside POS_TOL. Must stay ABOVE the speed at which the
+# base actually breaks away from rest -- if legs now stall short of the goal,
+# raise this back toward 0.06.
+NAV_MIN_LINEAR = _env("NAV_MIN_LINEAR", 0.045)
 # Operator-settable speed range for the UI slider (clamps POST /api/nav/speed).
 NAV_SPEED_MIN = _env("NAV_SPEED_MIN", 0.05)     # m/s slowest selectable
 NAV_SPEED_MAX = _env("NAV_SPEED_MAX", 0.80)     # m/s fastest selectable
@@ -231,7 +276,10 @@ NAV_POS_TOL = _env("NAV_POS_TOL", 0.025)
 # count against this budget. The watchdog now skips ticks where position is
 # already inside tolerance (see T265RoverService._tick), and this margin is the
 # second line of defence.
-NAV_STALL_TIMEOUT_S = _env("NAV_STALL_TIMEOUT_S", 8.0)
+# Lowered 8.0 -> 4.0 (2026-09-18): end-of-leg hunting never improves the best
+# distance, so this is how long any residual hunting can run before the leg is
+# failed as "stalled" and FOLLOW/AUTO re-plans from the live pose.
+NAV_STALL_TIMEOUT_S = _env("NAV_STALL_TIMEOUT_S", 4.0)
 # Heading deadband (rad). MUST be >= the arrival tolerance YAW_TOL (0.020 rad):
 # a controller that keeps correcting inside the band it is judged "arrived" in
 # will hunt. Inside the deadband the yaw command is zeroed and the integral is
@@ -261,9 +309,17 @@ NAV_MOVE_TIMEOUT_BASE_S = _env("NAV_MOVE_TIMEOUT_BASE_S", 9.0)
 # overshoots); it integrates TIME SPENT STUCK — accruing only while the rover is
 # commanded to move but is closing on the goal slower than LIN_STICTION_EPS, and
 # bleeding off again as soon as it moves properly. Mirrors YAW_IGAIN/YAW_I_MAX.
-NAV_LIN_IGAIN = _env("NAV_LIN_IGAIN", 0.6)          # m/s of boost per second stuck
-NAV_LIN_I_MAX = _env("NAV_LIN_I_MAX", 0.10)         # m/s cap on that boost (anti-windup)
-NAV_LIN_STICTION_EPS = _env("NAV_LIN_STICTION_EPS", 0.02)   # m/s: "not really moving"
+#
+# Softened 2026-09-18 (was IGAIN 0.6 / I_MAX 0.10 / EPS 0.02) -- this was the main
+# driver of the end-of-move hunting: an OVERSHOOT also reads as "not closing",
+# so the boost wound up on every overshoot and sent the rover back through the
+# tolerance ball at ~0.15 m/s, overshooting further each time. (It also jumps
+# straight to I_MAX on leaving the ball, because prev_dist/prev_t are not
+# updated while inside it.) Smaller gain + cap keep breakaway help but bound
+# the return speed to ~MIN_LINEAR + 0.04. A/B with IGAIN = 0 to disable it.
+NAV_LIN_IGAIN = _env("NAV_LIN_IGAIN", 0.2)          # m/s of boost per second stuck
+NAV_LIN_I_MAX = _env("NAV_LIN_I_MAX", 0.04)         # m/s cap on that boost (anti-windup)
+NAV_LIN_STICTION_EPS = _env("NAV_LIN_STICTION_EPS", 0.01)   # m/s: "not really moving"
 
 # ---- T265 relocalisation ---------------------------------------------------
 # The T265 maps its surroundings continuously and relocalises against that map
