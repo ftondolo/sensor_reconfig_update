@@ -71,12 +71,13 @@ class FlirThermal(SensorThread):
         self._next_frame_t = time.monotonic() + self._frame_interval
 
         ok, frame = self._cap.read()
+        t_rx = time.time()                      # host time the frame was received/decoded
         if not ok or frame is None:
             raise RuntimeError("FLIR read failed")
         # Stash the raw grayscale thermal frame for the detector (modality input
         # must be grayscale, not the colormapped display frame).
         gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self.raw.set(gray)
+        self.raw.set(gray, meta={"t_rx": t_rx})
         return self._encode(frame)
 
     def read_mock(self):
@@ -93,7 +94,7 @@ class FlirThermal(SensorThread):
         bg = 0.25 + 0.05 * np.sin(t + xx * 0.01)
         field = np.clip(bg + 0.75 * blob, 0, 1)
         gray = (field * 255).astype("uint8")
-        self.raw.set(gray)
+        self.raw.set(gray, meta={"t_rx": time.time()})
         time.sleep(self._frame_interval)
         return self._encode(gray)
 
