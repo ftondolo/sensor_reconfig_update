@@ -27,6 +27,10 @@ function fmtMM(p) {
 
 function fmtAccum(a) {
   if (!a || !a.phase || a.phase === "none") return "—";
+  if (a.phase === "averaging") {
+    const sp = a.spread_mm != null ? ` · ±${a.spread_mm} mm` : "";
+    return `${a.n}/${a.need} frames${sp}`;
+  }
   if (a.phase === "accumulating") return `accumulating ${a.n}/${a.need}`;
   return "confirmed";
 }
@@ -239,6 +243,175 @@ function applyStatus(status) {
   for (const name of Object.keys(s)) setBadge("st-" + name, s[name].status);
 }
 
+// --------------------------------------------------------- timing overlay
+// Debug overlay for the RGB and thermal views, switched on from the OPERATOR
+// page (server flag, arrives as msg.debug_overlay). While on, each view reads
+// its /stream/*_ts twin with fetch(): the same MJPEG, plus per-frame headers
+// with rover timestamps (frame received, boxes computed, box source frame,
+// render, send). Frames are shown by swapping the <img> to a blob URL, so the
+// overlay text always belongs to the frame on screen. While off, the views use
+// the plain streams exactly as before (no extra cost).
+//
+// Clock offset: the rover and this browser are usually different machines.
+// offset = rover_ms - browser_ms, estimated NTP-style from /api/time (lowest
+// round trip of 5 samples, refreshed every 15 s). Rover times are converted
+// to browser time before comparing with the live UI clock.
+const TS_VIEWS = {
+  rgb:     { img: "detect-img",  plain: "/stream/detect",         ts: "/stream/detect_ts",
+             ovl: "ovl-rgb",     label: "RGB" },
+  thermal: { img: "thermal-img", plain: "/stream/detect_thermal", ts: "/stream/detect_thermal_ts",
+             ovl: "ovl-thermal", label: "THERMAL" },
+};
+let overlayOn = false;
+const clockSync = { offset: null, rtt: null, timer: null };
+let ovlTimer = null;
+
+async function syncClock() {
+  let best = null;
+  for (let i = 0; i < 5; i++) {
+    try {
+      const t0 = Date.now();
+      const r = await fetch("/api/time", { cache: "no-store" });
+      const j = await r.json();
+      const t1 = Date.now();
+      const s = { rtt: t1 - t0, off: j.t * 1000 - (t0 + t1) / 2 };
+      if (!best || s.rtt < best.rtt) best = s;
+    } catch (e) { /* retry next sample */ }
+  }
+  if (best) { clockSync.offset = best.off; clockSync.rtt = best.rtt; }
+}
+
+function toLocalMs(roverMs) {
+  if (roverMs == null) return null;
+  return clockSync.offset == null ? roverMs : roverMs - clockSync.offset;
+}
+
+function fmtClock(ms) {
+  if (ms == null) return "—";
+  const d = new Date(ms);
+  const p = (n, w) => String(n).padStart(w, "0");
+  return `${p(d.getHours(), 2)}:${p(d.getMinutes(), 2)}:${p(d.getSeconds(), 2)}.${p(d.getMilliseconds(), 3)}`;
+}
+
+function fmtMs(v) { return v == null || !isFinite(v) ? "—" : `${Math.round(v)} ms`; }
+
+const CRLF2 = [13, 10, 13, 10];
+function findSeq(buf, seq, from) {
+  outer: for (let i = from; i <= buf.length - seq.length; i++) {
+    for (let j = 0; j < seq.length; j++) if (buf[i + j] !== seq[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+function hdrMs(head, name) {
+  const m = new RegExp(name + ":\\s*([0-9.]+)", "i").exec(head);
+  return m ? parseFloat(m[1]) * 1000 : null;
+}
+
+function startTsView(key) {
+  const v = TS_VIEWS[key];
+  const ctrl = new AbortController();
+  v.ctrl = ctrl;
+  (async () => {
+    try {
+      const resp = await fetch(v.ts, { signal: ctrl.signal, cache: "no-store" });
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = new Uint8Array(0);
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const nb = new Uint8Array(buf.length + value.length);
+        nb.set(buf); nb.set(value, buf.length); buf = nb;
+        for (;;) {
+          const hEnd = findSeq(buf, CRLF2, 0);
+          if (hEnd < 0) break;
+          const head = dec.decode(buf.subarray(0, hEnd));
+          const m = /Content-Length:\s*(\d+)/i.exec(head);
+          const start = hEnd + 4;
+          if (!m) { buf = buf.subarray(start); continue; }
+          const len = parseInt(m[1], 10);
+          if (buf.length < start + len) break;
+          showTsFrame(v, head, buf.slice(start, start + len));
+          buf = buf.subarray(start + len);
+        }
+      }
+    } catch (e) { /* aborted or dropped */ }
+    if (overlayOn && v.ctrl === ctrl) setTimeout(() => { if (overlayOn && v.ctrl === ctrl) startTsView(key); }, 1000);
+  })();
+}
+
+function showTsFrame(v, head, jpg) {
+  const url = URL.createObjectURL(new Blob([jpg], { type: "image/jpeg" }));
+  const img = $(v.img);
+  const meta = {
+    frame: hdrMs(head, "X-Frame-T"), box: hdrMs(head, "X-Box-T"),
+    boxSrc: hdrMs(head, "X-Box-Src-T"), render: hdrMs(head, "X-Render-T"),
+    send: hdrMs(head, "X-Send-T"), shown: null,
+  };
+  img.onload = () => { meta.shown = Date.now(); v.last = meta; };
+  const prev = v.url;
+  v.url = url;
+  img.src = url;
+  if (prev) setTimeout(() => URL.revokeObjectURL(prev), 1000);
+}
+
+function renderOverlays() {
+  const now = Date.now();
+  for (const key of Object.keys(TS_VIEWS)) {
+    const v = TS_VIEWS[key];
+    const el = $(v.ovl);
+    const m = v.last;
+    const lines = [];
+    if (!m) {
+      lines.push(`${v.label}  waiting for frames…`);
+    } else {
+      const frame = toLocalMs(m.frame), box = toLocalMs(m.box);
+      // frame->box uses rover times only (same clock, no offset needed).
+      const detect = (m.box != null && m.boxSrc != null) ? m.box - m.boxSrc : null;
+      const pad = (s) => s.padEnd(13, " ");
+      lines.push(`${v.label} timing`);
+      lines.push(pad("frame rx") + fmtClock(frame));
+      lines.push(pad("boxes") + fmtClock(box));
+      lines.push(pad("UI live") + fmtClock(now));
+      lines.push(pad("frame→box") + fmtMs(detect));
+      lines.push(pad("box→screen") + fmtMs(box != null ? m.shown - box : null));
+      lines.push(pad("frame→screen") + fmtMs(frame != null ? m.shown - frame : null));
+      lines.push(pad("frame age") + fmtMs(frame != null ? now - frame : null));
+    }
+    lines.push(clockSync.offset == null ? "clock Δ syncing…"
+      : `clock Δ ${clockSync.offset >= 0 ? "+" : ""}${Math.round(clockSync.offset)} ms (rtt ${Math.round(clockSync.rtt)})`);
+    el.textContent = lines.join("\n");
+  }
+}
+
+function setOverlay(on) {
+  overlayOn = !!on;
+  for (const key of Object.keys(TS_VIEWS)) {
+    const v = TS_VIEWS[key];
+    $(v.ovl).hidden = !overlayOn;
+    if (overlayOn) {
+      v.last = null;
+      startTsView(key);
+    } else {
+      if (v.ctrl) v.ctrl.abort();
+      v.ctrl = null;
+      $(v.img).onload = null;
+      $(v.img).src = v.plain;               // back to the plain stream
+      if (v.url) { const u = v.url; setTimeout(() => URL.revokeObjectURL(u), 1000); v.url = null; }
+    }
+  }
+  clearInterval(clockSync.timer); clearInterval(ovlTimer);
+  clockSync.timer = ovlTimer = null;
+  if (overlayOn) {
+    syncClock();
+    clockSync.timer = setInterval(syncClock, 15000);
+    ovlTimer = setInterval(renderOverlays, 50);
+    renderOverlays();
+  }
+}
+
 // --------------------------------------------------------- websocket
 let ws = null;
 function connectWS() {
@@ -253,6 +426,9 @@ function connectWS() {
     if (msg.detection) updateContrib(msg.detection);
     if (msg.nav) updateNav(msg.nav);
     if (msg.status) applyStatus(msg.status);
+    if (typeof msg.debug_overlay === "boolean" && msg.debug_overlay !== overlayOn) {
+      setOverlay(msg.debug_overlay);
+    }
   };
 }
 
