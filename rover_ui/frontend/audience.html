@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Rover Map Navigation — Live</title>
-  <link rel="stylesheet" href="/static/audience.css?v=demo13" />
+  <link rel="stylesheet" href="/static/audience.css?v=demo14" />
 </head>
 <body>
   <header class="topbar">
@@ -31,7 +31,7 @@
           <span>goal <b id="goal-xy">—</b></span>
           <span>leg <b id="nav-leg">—</b></span>
           <span>pose <b id="pose-src">—</b></span>
-          <span>accumulation <b id="nav-accum">—</b></span>
+          <span>target avg <b id="nav-accum">—</b></span>
         </div>
       </div>
       <div class="legend">
@@ -47,11 +47,13 @@
     <section class="grid">
       <div class="cam-card" id="card-rgb">
         <div class="cam-head"><span>RGB + Detection</span><span id="st-detector" class="badge">—</span></div>
-        <div class="cam-body"><img id="detect-img" class="cam-img" alt="rgb + detections" /></div>
+        <div class="cam-body"><img id="detect-img" class="cam-img" alt="rgb + detections" />
+          <div id="ovl-rgb" class="timing-ovl" hidden></div></div>
       </div>
       <div class="cam-card" id="card-thermal">
         <div class="cam-head"><span>Thermal (FLIR)</span><span id="st-flir_thermal" class="badge">—</span></div>
-        <div class="cam-body"><img id="thermal-img" class="cam-img" alt="thermal" /></div>
+        <div class="cam-body"><img id="thermal-img" class="cam-img" alt="thermal" />
+          <div id="ovl-thermal" class="timing-ovl" hidden></div></div>
       </div>
       <div class="cam-card">
         <div class="cam-head"><span>Depth (D435i)</span><span id="st-d435i_rgb" class="badge">—</span></div>
@@ -143,6 +145,6 @@
   </main>
 
   <script src="/static/map_view.js?v=demo12"></script>
-  <script src="/static/audience.js?v=demo14"></script>
+  <script src="/static/audience.js?v=demo16"></script>
 </body>
 </html>
