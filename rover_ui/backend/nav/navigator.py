@@ -25,6 +25,7 @@ Owns the movement logic of the demo:
 The T265 has exactly one owner in this process: the T265RoverService here.
 (Do not start a second T265 pose sensor thread alongside this.)
 """
+import collections
 import json
 import math
 import os
@@ -39,6 +40,7 @@ from . import tag_fusion
 if config.DEMO_ROOT not in sys.path:
     sys.path.insert(0, config.DEMO_ROOT)
 
+from rectilinear_mm import _seg_hits  # noqa: E402  (segment-vs-box test)
 from rectilinear_mm import (plan_rectilinear_path_ex,      # noqa: E402
                             obstacle_boxes, describe_obstacle_schema)
 from purely_control import T265RoverService       # noqa: E402
@@ -53,6 +55,56 @@ def _wrap_deg(d):
     the rover has turned, so a heading crossing +/-180 doesn't count as ~360."""
     return math.degrees(math.atan2(math.sin(math.radians(d)),
                                    math.cos(math.radians(d))))
+
+
+def _robust_average(samples, inlier_mm, jump_mm):
+    """Robust weighted mean of map samples [{x, z, snr, t}, ...] (oldest first).
+
+    Centre = medoid: the SAMPLE with the smallest summed distance to all the
+    others (always a real observation, never a midpoint between two clusters);
+    ties go to the newest sample. Each sample is then weighted by its distance
+    d from that centre: 1 within inlier_mm, tapering smoothly to 0 at jump_mm
+    (a Huber-style taper), so a one-frame ghost contributes nothing while the
+    genuine cluster is averaged. Radar samples whose reflection strength is far
+    from the window's typical value are down-weighted (soft, never to zero).
+    Returns {x, z, spread (weighted RMS distance to the mean, mm), inliers}."""
+    n = len(samples)
+    if n == 1:
+        s0 = samples[0]
+        return {"x": s0["x"], "z": s0["z"], "spread": 0.0, "inliers": 1}
+    best_i, best_cost = n - 1, None
+    for i in range(n - 1, -1, -1):          # newest first -> newest wins ties
+        si = samples[i]
+        cost = sum(math.hypot(si["x"] - q["x"], si["z"] - q["z"]) for q in samples)
+        if best_cost is None or cost < best_cost - 1e-6:
+            best_i, best_cost = i, cost
+    cx, cz = samples[best_i]["x"], samples[best_i]["z"]
+    snrs = [q["snr"] for q in samples if q.get("snr") is not None]
+    sref = _median(snrs) if snrs else None
+    inlier_mm = max(1.0, inlier_mm)
+    jump_mm = max(inlier_mm + 1.0, jump_mm)
+    ws, xs, zs = [], [], []
+    for q in samples:
+        d = math.hypot(q["x"] - cx, q["z"] - cz)
+        if d <= inlier_mm:
+            w = 1.0
+        elif d >= jump_mm:
+            w = 0.0
+        else:
+            w = (inlier_mm / d) * (jump_mm - d) / (jump_mm - inlier_mm)
+        if w > 0.0 and sref is not None and q.get("snr") is not None:
+            rel = abs(q["snr"] - sref) / max(q["snr"], sref, 1e-6)
+            w *= max(0.25, 1.0 - rel)
+        ws.append(w); xs.append(q["x"]); zs.append(q["z"])
+    wsum = sum(ws)
+    if wsum <= 1e-9:                         # cannot happen (centre has w=1), but be safe
+        return {"x": cx, "z": cz, "spread": 0.0, "inliers": 1}
+    mx = sum(w * x for w, x in zip(ws, xs)) / wsum
+    mz = sum(w * z for w, z in zip(ws, zs)) / wsum
+    spread = math.sqrt(sum(w * ((x - mx) ** 2 + (z - mz) ** 2)
+                           for w, x, z in zip(ws, xs, zs)) / wsum)
+    return {"x": mx, "z": mz, "spread": spread,
+            "inliers": sum(1 for w in ws if w >= 0.5)}
 
 
 def _median(vals):
@@ -148,17 +200,29 @@ class Navigator:
         self._parallax_t = 0.0           # last attempt, for the cooldown
         self._tag_parallax = None        # last attempt's outcome, for the UI
         self._target = None          # {x, z, t, range_m, az_deg, source}
-        self._target_win = []        # [(t, x, z)] raw projections for the median window
-        self._track = None           # {x, z, t, snr} continuity-gated target (anti-teleport)
-        self._track_reject_since = None  # when a far-jump detection started being held
-        self._pending_run = []       # [{x,z,snr,t}] accumulating confirmations for a
-                                      # fresh lock / relock (ghost-detection guard)
-        self._last_tel_seq = None    # last detector telemetry seq consumed (de-dupes
-                                      # repeated polls of the same frame in the run count)
-        # UI-facing summary of the above (see project_detection): whether a
-        # new location is still being accumulated/confirmed, or the track is
-        # currently confirmed and trusted. "none" until the first detection.
-        self._accum = {"phase": "none", "n": 0, "need": int(config.NAV_TARGET_CONFIRM_N)}
+        # Running-average window: the last NAV_TARGET_AVG_N_MAX DETECTION FRAMES
+        # (fresh detections only), newest last, in map mm. The estimate uses
+        # the newest NAV_TARGET_AVG_N of them. See _update_target_tracking.
+        self._det_buf = collections.deque(maxlen=max(1, int(config.NAV_TARGET_AVG_N_MAX)))
+        self._last_tel_seq = None    # last detector telemetry seq consumed (each
+                                      # detector frame enters the window at most once)
+        # UI-facing summary of the window (see _update_target_tracking):
+        # phase "none" until the first detection frame, then "averaging" with
+        # n = frames used, need = N, spread/inliers of the estimate.
+        self._accum = {"phase": "none", "n": 0, "need": int(config.NAV_TARGET_AVG_N)}
+        # ---- FOLLOW blind-time / corner-look state (see _corner_check) ----
+        self._last_fresh_t = None    # when the last detection frame was ACCEPTED
+                                      # into the window (any sensor) -> blind time
+        self._prior = None           # {x, z, t}: last known target position, kept
+                                      # when the window is emptied (look / long loss)
+        self._prior_pending = []     # detections outside the prior's gate, waiting
+                                      # for NAV_TARGET_PRIOR_CONFIRM_N to agree
+        self._follow_ctx = None      # {tx, tz}: target the current FOLLOW plan aims at
+        self._corner_replan_req = False  # re-plan at the next corner (deferred)
+        self._drive_outcome = None   # "replan" when _drive stopped at a corner
+        self._last_replan_t = 0.0    # hysteresis for corner re-plans
+        self._look = {"state": "idle"}   # UI: last corner-look status
+        self._plan_info = None       # UI: turn penalty / legs of the active plan
         self._goal = None            # {x, z, adjusted: bool}
         self._path = None            # [[x, z], ...] map waypoints of the active plan
         self._leg = 0                # index of the waypoint being driven to
@@ -344,6 +408,9 @@ class Navigator:
             else:
                 self._anchor_map = self._map_start
             self._anchor_pose = pose
+            # A re-anchor moves the whole map frame by an unknown amount:
+            # detections projected before it no longer line up with new ones.
+            self._det_buf.clear()
             # The pose is known-good again: everything the drift margin was
             # accumulating for has just been corrected, so start over.
             self._drift_dist_mm = 0.0
@@ -583,6 +650,12 @@ class Navigator:
                 # Shifting the anchor moves the whole map frame under the rover;
                 # yaw is untouched because it never references _anchor_map.
                 self._anchor_map = (self._anchor_map[0] + sx, self._anchor_map[1] + sz)
+                # Samples already in the target window were projected from the
+                # pre-correction pose; move them with the map frame so the
+                # running average stays consistent with new projections.
+                for q in self._det_buf:
+                    q["x"] += sx
+                    q["z"] += sz
             # A measured fix is a known-good pose: the drift margin starts over.
             self._drift_dist_mm = 0.0
             self._drift_turn_deg = 0.0
@@ -1067,8 +1140,8 @@ class Navigator:
     def _track_loop(self):
         """Background home of the stateful target tracker (see
         _update_target_tracking): runs it on ONE dedicated cadence
-        (NAV_TRACK_UPDATE_S) so the median window / continuity gate /
-        ghost-guard confirmation state is serviced exactly once per update,
+        (NAV_TRACK_UPDATE_S) so the running-average window is advanced
+        exactly once per detector frame,
         however many places want to read the result. _monitor_loop,
         _follow_loop and the UI (via state()) all just read the cached
         self._target through project_detection() below instead of each
@@ -1092,152 +1165,250 @@ class Navigator:
             return dict(self._target) if self._target else None
 
     def _update_target_tracking(self):
-        """Project the detector's live fused target (bearing + radar range)
-        into map mm and remember it. Returns the target dict or None.
+        """Advance the running-average target by at most ONE detection frame.
 
         Runs on its own cadence via _track_loop -- see project_detection()
-        for the cheap accessor everything else should call instead."""
+        for the cheap accessor everything else should call instead.
+
+        Only a NEW detector frame that carries a FRESH detection (detector.py
+        target["fresh"]: a real model box / a real radar cluster this frame,
+        not a coasted box or a held radar lock) and projects to a valid map
+        position is added to the window. Frames without a detection do NOT
+        advance it, so the window is always "the last N frames that contained
+        a detection", ending at the current one. The estimate uses whatever is
+        in the window (1..N): it never waits for the window to fill."""
         if self._detector is None:
             return None
+        now = time.time()
+        forget = float(config.NAV_TARGET_FORGET_S)
+        with self._lock:
+            # Long loss: the window holds a position the person has likely
+            # left. Clear it, but keep that position as a PRIOR (last known
+            # position): the next detection near it is accepted at once, one
+            # far from it has to be corroborated (see _accept_sample).
+            if self._det_buf and now - self._det_buf[-1]["t"] > forget:
+                self._set_prior_locked(self._det_buf[-1]["t"])
+                self._det_buf.clear()
+                self._accum = {"phase": "none", "n": 0,
+                               "need": int(config.NAV_TARGET_AVG_N)}
         tel, seq = self._detector.telemetry.get()
         if not tel:
             return None
+        with self._lock:
+            if seq == self._last_tel_seq:
+                return None                 # same detector frame as last time
+            self._last_tel_seq = seq
         tgt = tel.get("target")
-        if not tgt or tgt.get("range") is None or tgt.get("az") is None:
+        if not tgt:
+            return None
+        # Detectors that predate the freshness flag: treat every frame with a
+        # target as a detection frame (the old behaviour).
+        if not tgt.get("fresh", True):
+            return None
+        az = tgt.get("raw_az") if tgt.get("raw_az") is not None else tgt.get("az")
+        rng = tgt.get("raw_range") if tgt.get("raw_range") is not None else tgt.get("range")
+        if rng is None or az is None:
             return None
         # Radar is only rejected here while moving if the detector has no
-        # lock to maintain (it clears the target in that case, so tgt would
-        # already be None/non-radar). An ALREADY-acquired lock is kept live
-        # by the detector's tracker through the rover's own motion (purely
-        # spatial maintenance, no Doppler involved -- see radar_tracker.py),
-        # so it's trusted here the same as any other live source. Acquiring
-        # a brand-new radar lock still requires the rover to be stationary;
-        # that rule lives in RadarTracker/detector.py, not here.
+        # lock to maintain (it clears the target in that case). An ALREADY-
+        # acquired lock is kept live by the detector's tracker through the
+        # rover's own motion (purely spatial, no Doppler) -- see radar_tracker.py.
         p = self.pose()
         if p is None:
             return None
-        rng_mm = float(tgt["range"]) * 1000.0
+        rng_mm = float(rng) * 1000.0
         # Bearing and range are measured from the COLOUR CAMERA, which sits at
         # its own lever arm from the rover's turn centre. Projecting from the
         # rover centre makes a stationary target appear to swing every time the
         # rover rotates, by the camera's arc. Walk out to the camera first.
         cx, cz = self._camera_map_xz(p)
-        bearing = math.radians(p["yaw_deg"] + float(tgt["az"]))
+        bearing = math.radians(p["yaw_deg"] + float(az))
         tx = cx + rng_mm * math.sin(bearing)
         tz = cz - rng_mm * math.cos(bearing)
         # Clamp into the map so a noisy range can't paint the marker off-canvas.
         tx = max(0.0, min(self.map_w, tx))
         tz = max(0.0, min(self.map_d, tz))
-        # Invalidate detections that land in a no-target zone (obstacle + clear
-        # margin): a real target can't be there, so do NOT update the target /
-        # track — the rover never generates a goal from such a detection. The
-        # previous target simply holds and ages out as usual.
+        # A detection inside a no-target zone (obstacle + clear margin) cannot
+        # be a real target: it is not a valid detection frame and does not
+        # enter the window. The previous target simply holds.
         if self._in_exclusion(tx, tz):
             return None
-        # Reflected intensity (mmWave only; None for a vision-sourced target).
-        # Used below purely as a CONSISTENCY check against a reference value —
-        # never as an absolute quality gate here (the radar tracker already
-        # applies its own SNR floor before it ever offers a target).
         is_radar = tgt.get("source") == "radar"
-        snr = float(tgt["snr_peak"]) if (is_radar and tgt.get("snr_peak") is not None) else None
-        now = time.time()
-        win = float(config.NAV_TARGET_WINDOW_S)
+        snr = (float(tgt["snr_peak"]) if (is_radar and tgt.get("snr_peak") is not None)
+               else None)
         with self._lock:
-            # Median over a short window: a transient wrong detection is an
-            # outlier and gets out-voted, so the target never jumps short-term;
-            # a sustained move shifts the median once it dominates the window.
-            self._target_win = [(ts, x, z) for (ts, x, z) in self._target_win
-                                if now - ts <= win] + [(now, tx, tz)]
-            fx = _median([x for _, x, _ in self._target_win])
-            fz = _median([z for _, _, z in self._target_win])
-            is_new_frame = seq != self._last_tel_seq
-            self._last_tel_seq = seq
-
-            jump = float(config.NAV_TARGET_JUMP_MM)
-            relock = float(config.NAV_TARGET_RELOCK_S)
-            forget = float(config.NAV_TARGET_FORGET_S)
-            confirm_n = max(1, int(config.NAV_TARGET_CONFIRM_N))
-            snr_tol = float(config.NAV_TARGET_SNR_TOL)
-
-            def _snr_close(a, b):
-                """True when two radar reflection intensities are within
-                snr_tol of each other (relative tolerance) -- a stand-in for
-                "this still looks like the same reflector, not interference".
-                Either side missing (non-radar, or no baseline yet) -> no
-                opinion, so it never blocks a vision-side comparison."""
-                if a is None or b is None:
-                    return True
-                return abs(a - b) <= snr_tol * max(a, b, 1e-6)
-
-            tr = self._track
-            stale = tr is None or (now - tr["t"]) > forget
-            near = (not stale
-                    and math.hypot(fx - tr["x"], fz - tr["z"]) <= jump
-                    and _snr_close(snr, tr.get("snr")))
-
-            if near:
-                # Trusted continuity: light EMA update straight onto the track,
-                # same as before -- an already-locked target doesn't need to
-                # re-earn trust every frame, only a NEW or relocated one does.
-                a = 0.5
-                self._track = {"x": a * fx + (1 - a) * tr["x"],
-                               "z": a * fz + (1 - a) * tr["z"], "t": now,
-                               "snr": snr if snr is not None else tr.get("snr")}
-                self._track_reject_since = None
-                self._pending_run = []
-                self._accum = {"phase": "confirmed", "n": confirm_n, "need": confirm_n}
-            else:
-                # Disagrees with the current track (continuity gate), or there's
-                # no usable track yet (first-ever lock / long loss). GHOST GUARD:
-                # this is only committed once NAV_TARGET_CONFIRM_N mutually-
-                # consistent, DISTINCT detector frames have accumulated — a
-                # single-frame ghost never earns enough corroboration to
-                # overwrite the track (or seed a new one) and just ages out of
-                # the accumulation window. `is_new_frame` de-dupes repeated
-                # polls of the same detector output (this method is called
-                # faster than the detector produces frames) so the count
-                # reflects genuinely separate observations.
-                if not stale and self._track_reject_since is None:
-                    self._track_reject_since = now
-                if is_new_frame:
-                    run = self._pending_run
-                    ref = run[-1] if run else None
-                    consistent = (ref is None
-                                  or (math.hypot(fx - ref["x"], fz - ref["z"]) <= jump
-                                      and _snr_close(snr, ref.get("snr"))))
-                    if consistent:
-                        run.append({"x": fx, "z": fz, "snr": snr, "t": now})
-                    else:
-                        run = [{"x": fx, "z": fz, "snr": snr, "t": now}]  # restart the run here
-                    # Bound the run to the relock window so it can't be stitched
-                    # together from detections spread too far apart in time.
-                    self._pending_run = [q for q in run if now - q["t"] <= relock]
-
-                ready = len(self._pending_run) >= confirm_n
-                sustained = stale or (now - self._track_reject_since >= relock)
-                if ready and sustained:
-                    gx = _median([q["x"] for q in self._pending_run])
-                    gz = _median([q["z"] for q in self._pending_run])
-                    snrs = [q["snr"] for q in self._pending_run if q["snr"] is not None]
-                    gsnr = _median(snrs) if snrs else None
-                    self._track = {"x": gx, "z": gz, "t": now, "snr": gsnr}
-                    self._track_reject_since = None
-                    self._pending_run = []
-                    self._accum = {"phase": "confirmed", "n": confirm_n, "need": confirm_n}
-                else:
-                    if tr is not None:
-                        tr["t"] = now   # hold the last verified position while we wait
-                    self._accum = {"phase": "accumulating",
-                                   "n": len(self._pending_run), "need": confirm_n}
-
-            if self._track is None:
-                return None   # still accumulating confirmations; nothing verified yet
-            fx, fz = self._track["x"], self._track["z"]
-            t = {"x": fx, "z": fz, "t": now,
-                 "range_m": round(float(tgt["range"]), 2),
-                 "az_deg": float(tgt["az"]), "source": tgt.get("source")}
+            if not self._accept_sample_locked({"t": now, "x": tx, "z": tz, "snr": snr}):
+                return None             # outside the prior's gate, still confirming
+            self._last_fresh_t = now
+            n_want = max(1, int(config.NAV_TARGET_AVG_N))
+            window = list(self._det_buf)[-n_want:]
+            est = _robust_average(window,
+                                  float(config.NAV_TARGET_INLIER_MM),
+                                  float(config.NAV_TARGET_JUMP_MM))
+            self._accum = {"phase": "averaging", "n": len(window), "need": n_want,
+                           "spread_mm": round(est["spread"]),
+                           "inliers": est["inliers"]}
+            t = {"x": est["x"], "z": est["z"], "t": now,
+                 "range_m": round(float(rng), 2),
+                 "az_deg": float(az), "source": tgt.get("source"),
+                 "spread_mm": round(est["spread"]), "n": len(window)}
             self._target = t
         return t
+
+    # ------------------------------------------------------------ last known position (prior)
+    def _set_prior_locked(self, t_seen):
+        """Remember the current target estimate as the last known position.
+        Lock held."""
+        if self._target is not None and self._target.get("x") is not None:
+            self._prior = {"x": float(self._target["x"]), "z": float(self._target["z"]),
+                           "t": float(t_seen)}
+            self._prior_pending = []
+
+    def _prior_gate_mm(self, now):
+        """Radius around the last known position that a person could have
+        reached by now: R0 + walking speed x time since last seen, capped."""
+        age = max(0.0, now - self._prior["t"])
+        return min(float(config.NAV_TARGET_PRIOR_R0_MM)
+                   + float(config.NAV_TARGET_PRIOR_SPEED_MM_S) * age,
+                   float(config.NAV_TARGET_PRIOR_MAX_MM))
+
+    def _accept_sample_locked(self, q):
+        """Add a projected detection to the averaging window, applying the
+        last-known-position gate when the window is empty. Lock held.
+        Returns True when the sample entered the window.
+
+          * no prior, or the window already has samples -> accept (the robust
+            average itself handles outliers);
+          * window empty and the sample lies INSIDE the prior's gate -> accept
+            from this single frame, prior consumed;
+          * window empty and OUTSIDE the gate (a far jump: could be a ghost) ->
+            held as pending until NAV_TARGET_PRIOR_CONFIRM_N mutually
+            consistent frames agree, then all of them enter the window."""
+        prior = self._prior
+        if prior is None or self._det_buf:
+            self._det_buf.append(q)
+            return True
+        now = q["t"]
+        if math.hypot(q["x"] - prior["x"], q["z"] - prior["z"]) <= self._prior_gate_mm(now):
+            self._prior, self._prior_pending = None, []
+            self._det_buf.append(q)
+            return True
+        jump = float(config.NAV_TARGET_JUMP_MM)
+        max_age = max(2.0, 2.0 * float(config.NAV_FOLLOW_LOOK_MAX_S))
+        pend = [p for p in self._prior_pending if now - p["t"] <= max_age]
+        if pend and math.hypot(q["x"] - pend[-1]["x"], q["z"] - pend[-1]["z"]) > jump:
+            pend = []                       # inconsistent with the run: restart it
+        pend.append(q)
+        need = max(1, int(config.NAV_TARGET_PRIOR_CONFIRM_N))
+        if len(pend) < need:
+            self._prior_pending = pend
+            self._accum = {"phase": "confirming", "n": len(pend), "need": need}
+            return False
+        self._prior, self._prior_pending = None, []
+        for p in pend:
+            self._det_buf.append(p)
+        return True
+
+    # ------------------------------------------------------------ FOLLOW corner look
+    def _corner_check(self, i, waypoints):
+        """Called by _drive at a corner (rover stopped, before leg i). FOLLOW
+        only. Returns "replan" to end this drive here so the follow loop
+        re-plans from the corner, else "continue".
+
+        1. Deferred re-plan requested (target moved mid-leg, or cycle cap) ->
+           replan now, without stopping mid-straight.
+        2. Blind-time limit: look when the time since the last accepted
+           detection (ANY sensor) is >= NAV_FOLLOW_BLIND_S, or would exceed it
+           by the end of the next leg.
+        3. Look: wait up to NAV_FOLLOW_LOOK_MAX_S for a fresh detection, exiting
+           as soon as one is accepted.
+        4. Re-plan only if needed: standoff goal shifted > NAV_GOAL_TOLERANCE_MM,
+           or target moved >= NAV_FOLLOW_REPLAN_MM, or it switched sides —
+           and not within NAV_FOLLOW_REPLAN_MIN_INTERVAL_S of the last one."""
+        with self._lock:
+            follow = self._follow
+            ctx = dict(self._follow_ctx) if self._follow_ctx else None
+            req = self._corner_replan_req
+            last_fresh = self._last_fresh_t
+        if not follow or ctx is None:
+            return "continue"
+        now = time.time()
+        if req:
+            with self._lock:
+                self._corner_replan_req = False
+                self._last_replan_t = now
+            return "replan"
+        p = self.pose()
+        if p is None:
+            return "continue"
+        # Remaining path length from the live pose through the rest of the plan.
+        remain, px, pz = 0.0, p["x"], p["z"]
+        for (wx, wz) in waypoints[i:]:
+            remain += math.hypot(wx - px, wz - pz)
+            px, pz = wx, wz
+        if remain < float(config.NAV_FOLLOW_LOOK_MIN_REMAIN_MM):
+            return "continue"             # the arrival look covers it
+        blind = (now - last_fresh) if last_fresh is not None else float("inf")
+        wx, wz = waypoints[i]
+        speed = max(float(self.rover.cfg.MAX_LINEAR), 0.05)          # m/s
+        next_leg_s = math.hypot(wx - p["x"], wz - p["z"]) / 1000.0 / speed * 1.2 + 1.0
+        limit = float(config.NAV_FOLLOW_BLIND_S)
+        if blind < limit and blind + next_leg_s <= limit:
+            return "continue"
+        # ---- look ----
+        look_t0 = time.time()
+        with self._lock:
+            # Samples from before the stop are stale: move the estimate into
+            # the prior so a detection now is judged against the last known
+            # position rather than out-voted by old frames.
+            if self._det_buf:
+                self._set_prior_locked(self._det_buf[-1]["t"])
+                self._det_buf.clear()
+            elif self._prior is None:
+                self._set_prior_locked(self._last_fresh_t or look_t0)
+            self._look = {"state": "looking", "since": round(look_t0, 2),
+                          "blind_s": round(blind, 1) if blind != float("inf") else None}
+            self._message = "follow: looking at corner (blind %.1f s)…" % min(blind, 999.0)
+        cap = float(config.NAV_FOLLOW_LOOK_MAX_S)
+        got = False
+        while time.time() - look_t0 < cap:
+            if self._cancel.is_set() or self._stop.is_set():
+                return "continue"
+            with self._lock:
+                got = self._last_fresh_t is not None and self._last_fresh_t >= look_t0
+            if got:
+                break
+            self._stop.wait(0.05)
+        look_s = round(time.time() - look_t0, 2)
+        if not got:
+            with self._lock:
+                self._look = {"state": "timeout", "look_s": look_s}
+                self._message = "follow: nothing seen at corner, continuing to last known position"
+            return "continue"
+        t = self.project_detection()
+        if t is None:
+            return "continue"
+        # ---- re-plan only when needed ----
+        moved = math.hypot(t["x"] - ctx["tx"], t["z"] - ctx["tz"])
+        side_old, side_new = ctx["tx"] - p["x"], t["x"] - p["x"]
+        switched = (side_old * side_new < 0
+                    and abs(side_new - side_old) >= float(config.NAV_FOLLOW_SIDE_SWITCH_MM))
+        new_goal = self.compute_goal(t["x"], t["z"])
+        with self._lock:
+            cur_goal = dict(self._goal) if self._goal else None
+        goal_shift = (new_goal is not None and cur_goal is not None
+                      and math.hypot(new_goal["x"] - cur_goal["x"], new_goal["z"] - cur_goal["z"])
+                      > float(config.NAV_GOAL_TOLERANCE_MM))
+        need = goal_shift or moved >= float(config.NAV_FOLLOW_REPLAN_MM) or switched
+        recent = time.time() - self._last_replan_t < float(config.NAV_FOLLOW_REPLAN_MIN_INTERVAL_S)
+        with self._lock:
+            if need and not recent:
+                self._look = {"state": "replan", "look_s": look_s, "moved_mm": round(moved)}
+                self._last_replan_t = time.time()
+                return "replan"
+            self._look = {"state": "unchanged", "look_s": look_s, "moved_mm": round(moved)}
+            self._message = "follow: target unchanged, continuing"
+        return "continue"
 
     # ------------------------------------------------------------ navigation
     def navigate_to_detection(self):
@@ -1247,9 +1418,14 @@ class Navigator:
             return False, "no detection target with range available"
         return self.navigate_to_target(t["x"], t["z"])
 
-    def navigate_to_target(self, tx, tz):
-        """Plan + drive to the standoff goal of a target at map (tx, tz)."""
+    def navigate_to_target(self, tx, tz, follow=False):
+        """Plan + drive to the standoff goal of a target at map (tx, tz).
+        follow=True (FOLLOW loop only) enables the FOLLOW path preference and
+        the corner checks in _drive."""
         goal = self.compute_goal(float(tx), float(tz))
+        with self._lock:
+            self._follow_ctx = {"tx": float(tx), "tz": float(tz)} if follow else None
+            self._corner_replan_req = False
         with self._lock:
             self._target = (self._target
                             if self._target and self._target.get("x") == float(tx)
@@ -1260,7 +1436,7 @@ class Navigator:
                 self._status, self._message, self._goal, self._path = \
                     "blocked", "no free standoff position near the target", None, None
             return False, self._message
-        return self._dispatch(goal)
+        return self._dispatch(goal, follow=follow)
 
     def return_to_start(self):
         """Drive straight back to the configured start cell (map.json
@@ -1278,7 +1454,87 @@ class Navigator:
                             "range_m": None, "az_deg": None, "source": "home"}
         return self._dispatch({"x": gx, "z": gz, "adjusted": False})
 
-    def _dispatch(self, goal):
+    def _plan_segments(self, plan_cfg, start, end, follow):
+        """Plan a path; for FOLLOW, add corners to look from (see
+        _staircase). Returns (segs, achieved_clearance, info)."""
+        segs, achieved = plan_rectilinear_path_ex(
+            self.map, plan_cfg, start, end, ignore_start_obstacle=self._ignore_obstacles)
+        info = {"staircase": False}
+        if not follow or segs is None or self._ignore_obstacles:
+            return segs, achieved, info
+        clr = achieved if achieved is not None else float(plan_cfg.get("clearance", 0))
+        segs2 = self._staircase(start, segs, float(clr))
+        if len(segs2) > len(segs):
+            info["staircase"] = True
+        return segs2, achieved, info
+
+    def _staircase(self, start, segs, clearance):
+        """More corners without extra distance. The planner always prefers the
+        fewest turns (on a grid, a path with more turns is never shorter, so
+        any positive turn_penalty picks the L-shape). For FOLLOW, each L-shaped
+        pair of legs (one along x, the next along z, or vice versa) where a leg
+        is longer than NAV_FOLLOW_MAX_LEG_MM is re-cut into a staircase of k
+        alternating steps: same start, same end, same total length, but a
+        corner every ~MAX_LEG where the rover can stop and look.
+
+        A staircase is used only when every step keeps at least the clearance
+        the original route achieved (obstacles inflated by half the car plus
+        that clearance); otherwise fewer steps are tried, and failing that the
+        original pair is kept. Steps shorter than NAV_FOLLOW_MIN_STEP_MM are
+        never produced. A single long straight leg with no perpendicular
+        neighbour is left as is (it cannot gain a corner without a detour)."""
+        max_leg = float(config.NAV_FOLLOW_MAX_LEG_MM)
+        min_step = float(config.NAV_FOLLOW_MIN_STEP_MM)
+        if max_leg <= 0:
+            return segs
+        mx = self.car_w / 2.0 + clearance
+        mz = self.car_l / 2.0 + clearance
+        boxes = [(o["x"] - mx, o["z"] - mz, o["x"] + o["w"] + mx, o["z"] + o["h"] + mz)
+                 for o in self._obstacles]
+
+        def advance(pt, steps):
+            x, z = pt
+            for ax, d in steps:
+                if ax == "x":
+                    x += d
+                else:
+                    z += d
+            return (x, z)
+
+        def clear(pt, steps):
+            x, z = pt
+            for ax, d in steps:
+                nx, nz = (x + d, z) if ax == "x" else (x, z + d)
+                if any(_seg_hits(x, z, nx, nz, bx) for bx in boxes):
+                    return False
+                x, z = nx, nz
+            return True
+
+        out, i, cur = [], 0, (float(start[0]), float(start[1]))
+        while i < len(segs):
+            ax, d = segs[i]
+            if i + 1 < len(segs) and segs[i + 1][0] != ax:
+                bx_, e = segs[i + 1]
+                big, small = max(abs(d), abs(e)), min(abs(d), abs(e))
+                k_want = int(math.ceil(big / max_leg)) if big > max_leg else 1
+                k_max = int(small // min_step) if min_step > 0 else k_want
+                chosen = None
+                for k in range(min(k_want, k_max), 1, -1):
+                    steps = [(ax, d / k), (bx_, e / k)] * k
+                    if clear(cur, steps):
+                        chosen = steps
+                        break
+                steps = chosen if chosen else [segs[i], segs[i + 1]]
+                out.extend(steps)
+                cur = advance(cur, steps)
+                i += 2
+            else:
+                out.append(segs[i])
+                cur = advance(cur, [segs[i]])
+                i += 1
+        return out
+
+    def _dispatch(self, goal, follow=False):
         if self._nav_thread is not None and self._nav_thread.is_alive():
             return False, "a navigation is already running (cancel it first)"
         p = self.pose()
@@ -1306,16 +1562,12 @@ class Navigator:
         if drift_mm > 0.0:
             plan_cfg = dict(plan_cfg)
             plan_cfg["clearance"] = float(plan_cfg.get("clearance", 0)) + drift_mm
-        segs, achieved = plan_rectilinear_path_ex(
-            self.map, plan_cfg, start, end,
-            ignore_start_obstacle=self._ignore_obstacles)
+        segs, achieved, pinfo = self._plan_segments(plan_cfg, start, end, follow)
         if segs is None and drift_mm > 0.0:
             # The drift margin alone made this unreachable. Fall back to the
             # configured clearance rather than refusing to move: a conservative
             # margin must never be the reason the rover strands itself.
-            segs, achieved = plan_rectilinear_path_ex(
-                self.map, self.plan_cfg, start, end,
-                ignore_start_obstacle=self._ignore_obstacles)
+            segs, achieved, pinfo = self._plan_segments(self.plan_cfg, start, end, follow)
         if segs is None:
             with self._lock:
                 self._status = "no_path"
@@ -1334,6 +1586,9 @@ class Navigator:
             self._path = [[round(start[0]), round(start[1])]] + [[round(x), round(z)] for x, z in wps]
             self._plan_clearance = achieved
             self._status = "moving"
+            self._drive_outcome = None
+            self._plan_info = dict(pinfo, legs=len(wps),
+                                   longest_mm=round(max(abs(float(d)) for _, d in segs)))
         self._cancel.clear()
         self._nav_thread = threading.Thread(target=self._drive, args=(wps,), daemon=True)
         self._nav_thread.start()
@@ -1341,6 +1596,7 @@ class Navigator:
 
     def _drive(self, waypoints):
         try:
+            driven = 0                      # legs actually driven so far
             for i, (wx, wz) in enumerate(waypoints):
                 with self._lock:
                     self._leg = i + 1
@@ -1361,6 +1617,16 @@ class Navigator:
                 if leg_mm < float(config.NAV_POS_TOL) * 1000.0:
                     continue
                 if self._cancel.is_set():
+                    return
+                # FOLLOW corner check: the rover is stopped at a corner of the
+                # plan, the only place it may pause. Look again if it has been
+                # blind too long, and end this drive here if the target has
+                # moved enough to need a new plan (see _corner_check).
+                if driven > 0 and self._corner_check(i, waypoints) == "replan":
+                    with self._lock:
+                        self._drive_outcome = "replan"
+                        self._status = "arrived"
+                        self._message = "follow: re-planning at corner"
                     return
                 # Zero-velocity drift sample: the rover is stopped between legs,
                 # so its TRUE velocity is zero and any pose change the T265
@@ -1435,6 +1701,7 @@ class Navigator:
                 # consistent ratio across many legs indicates a fixed VIO SCALE
                 # error (correctable); random scatter indicates slip or noise.
                 self._log_leg(i + 1, leg_mm, wx, wz, res)
+                driven += 1
                 if res is None or not res:
                     reason = res.reason if res is not None else "no result"
                     with self._lock:
@@ -1535,17 +1802,21 @@ class Navigator:
             self._ignore_obstacles = bool(enabled)
         return self._ignore_obstacles
 
-    # ------------------------------------------------------------ ghost-guard confirm count
-    def set_confirm_n(self, n):
-        """Operator-settable ghost-detection guard threshold: how many
-        mutually-consistent detector frames must accumulate before a new/
-        relocated target is trusted (see project_detection). Clamped to
-        [1, 10]. project_detection() re-reads config.NAV_TARGET_CONFIRM_N
-        live every call, so this takes effect on the very next detection --
-        no restart needed. Returns the clamped value actually applied."""
-        applied = max(1, min(10, int(n)))
+    # ------------------------------------------------------------ running-average window
+    def set_avg_n(self, n):
+        """Operator-settable running-average window: how many of the most
+        recent DETECTION FRAMES the target estimate averages over (see
+        _update_target_tracking). Clamped to [NAV_TARGET_AVG_N_MIN,
+        NAV_TARGET_AVG_N_MAX]. Takes effect on the next detection frame; the
+        buffer already holds up to the max, so a larger N uses existing history
+        immediately rather than waiting. Returns the value actually applied."""
+        lo = int(config.NAV_TARGET_AVG_N_MIN)
+        hi = int(config.NAV_TARGET_AVG_N_MAX)
+        applied = max(lo, min(hi, int(n)))
         with self._lock:
-            config.NAV_TARGET_CONFIRM_N = applied
+            config.NAV_TARGET_AVG_N = applied
+            if self._accum.get("phase") != "none":
+                self._accum["need"] = applied
         return applied
 
     # ------------------------------------------------------------ auto / follow mode
@@ -1563,12 +1834,14 @@ class Navigator:
             self._follow = bool(enabled)
             if self._follow:
                 self._auto = False
-                # Fresh lock: drop any stale track so follow locks onto wherever
-                # the person is right now (no carry-over teleport from before).
-                # Still has to pass the confirm-N ghost guard before it commits.
-                self._track = None
-                self._track_reject_since = None
-                self._pending_run = []
+                # Fresh lock: empty the running-average window so follow locks
+                # onto wherever the person is right now (no carry-over from
+                # detections made before follow was switched on).
+                self._det_buf.clear()
+                self._prior, self._prior_pending = None, []
+                self._corner_replan_req = False
+                self._accum = {"phase": "none", "n": 0,
+                               "need": int(config.NAV_TARGET_AVG_N)}
 
     def _follow_loop(self):
         """FOLLOW = a strict SENSE-while-stationary -> COMMIT -> MOVE -> re-stop
@@ -1647,7 +1920,7 @@ class Navigator:
             if t.get("source") == "radar":
                 radar_confirmed = True
             # ---------------- COMMIT + MOVE PHASE ----------------
-            ok, _msg = self.navigate_to_target(t["x"], t["z"])
+            ok, _msg = self.navigate_to_target(t["x"], t["z"], follow=True)
             with self._lock:
                 navving = self._nav_thread is not None and self._nav_thread.is_alive()
             if not ok or not navving:
@@ -1688,7 +1961,10 @@ class Navigator:
                         side_new = nt["x"] - p_now["x"]
                         switched_side = (side_old * side_new < 0
                                         and abs(side_new - side_old) >= side_switch_mm)
-                    if moved_mm >= replan_mm or switched_side:
+                    # Only a side switch or a VERY large move stops the rover
+                    # mid-leg. An ordinary move (>= replan_mm) is deferred to
+                    # the next corner, where _drive ends the plan cleanly.
+                    if switched_side or moved_mm >= float(config.NAV_FOLLOW_MIDLEG_REPLAN_MM):
                         self.cancel()
                         with self._lock:
                             self._status = "moving"
@@ -1696,16 +1972,36 @@ class Navigator:
                                              if switched_side else
                                              "follow: target moved, re-targeting")
                         break
+                    if moved_mm >= replan_mm:
+                        with self._lock:
+                            if not self._corner_replan_req:
+                                self._corner_replan_req = True
+                                self._message = "follow: target moved, re-planning at next corner"
                 if time.time() >= deadline:
-                    self.cancel()                  # stuck-backstop -> treat as done
+                    # Cycle cap: re-plan at the next corner rather than stopping
+                    # mid-straight. A hard backstop (twice the cap) still
+                    # cancels outright if no corner is ever reached.
                     with self._lock:
-                        self._status = "arrived"
-                        self._message = "follow: cycle time cap reached, re-targeting"
-                    break
+                        if not self._corner_replan_req:
+                            self._corner_replan_req = True
+                            self._message = "follow: cycle time cap reached, re-planning at next corner"
+                    if time.time() >= deadline + cap:
+                        self.cancel()
+                        with self._lock:
+                            self._status = "arrived"
+                            self._message = "follow: cycle time cap reached, re-targeting"
+                        break
                 self._stop.wait(0.1)
             # Move ended -> rover is stopping; open a fresh stationary window so the
             # next radar lock must be re-confirmed while still.
             still_since = time.time()
+            with self._lock:
+                corner_replan = self._drive_outcome == "replan"
+                self._drive_outcome = None
+            if corner_replan:
+                # The corner look just acquired the target while the rover was
+                # stationary, so a radar lock does not need to re-earn stillness.
+                radar_confirmed = True
 
     def _maybe_parallax(self, busy):
         """Start a parallax run if the geometry has been unusable long enough.
@@ -1800,7 +2096,9 @@ class Navigator:
             "jog_speed": round(float(self._jog_speed), 3),
             "jog_speed_min": float(config.NAV_JOG_SPEED_MIN),
             "jog_speed_max": float(config.NAV_JOG_SPEED_MAX),
-            "confirm_n": int(config.NAV_TARGET_CONFIRM_N),
+            "avg_n": int(config.NAV_TARGET_AVG_N),
+            "avg_n_min": int(config.NAV_TARGET_AVG_N_MIN),
+            "avg_n_max": int(config.NAV_TARGET_AVG_N_MAX),
         }
 
     def state(self):
@@ -1813,6 +2111,16 @@ class Navigator:
             auto, follow = self._auto, self._follow
             ignore_obstacles = self._ignore_obstacles
             accum = dict(self._accum)
+            follow_info = {
+                "blind_s": (round(time.time() - self._last_fresh_t, 1)
+                            if self._last_fresh_t is not None else None),
+                "look": dict(self._look),
+                "corner_replan_pending": bool(self._corner_replan_req),
+                "plan": dict(self._plan_info) if self._plan_info else None,
+                "prior": ({"x": round(self._prior["x"]), "z": round(self._prior["z"]),
+                           "gate_mm": round(self._prior_gate_mm(time.time()))}
+                          if self._prior else None),
+            }
             plan_clearance = self._plan_clearance
             zupt = self._zupt_mm_s
             drift_d, drift_t = self._drift_dist_mm, self._drift_turn_deg
@@ -1888,12 +2196,13 @@ class Navigator:
                          "min": round(min(yh), 2), "max": round(max(yh), 2)}
                         if yh else None),
             "accum": accum,
+            "follow_info": follow_info,
             "status": status,
             "message": message,
             "auto": auto,
             "follow": follow,
             "ignore_obstacles": ignore_obstacles,
-            "confirm_n": int(config.NAV_TARGET_CONFIRM_N),
+            "avg_n": int(config.NAV_TARGET_AVG_N),
             "speed": round(float(self.rover.cfg.MAX_LINEAR), 3),
             # Operator-settable approach distance, so the UI field stays in
             # sync if another client changes it mid-session.
