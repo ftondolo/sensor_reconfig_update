@@ -290,3 +290,6 @@ html, body {
   white-space: pre; pointer-events: none;
 }
 .timing-ovl[hidden] { display: none; }
+/* delay history plot: a thin line hugging the image's bottom edge (no fill) */
+.timing-plot { position: absolute; z-index: 2; pointer-events: none; }
+.timing-plot[hidden] { display: none; }
