@@ -10,9 +10,9 @@ Owns the movement logic of the demo:
     map coordinates — the "detection marker" the audience map shows;
   * computes the rover goal: the target shifted NAV_STANDOFF_MM toward the
     bottom of the map (the rover side), i.e. target (x, z) -> goal
-    (x, z + 2000). If the rover footprint at that point overlaps an obstacle
-    region (inflated by car/2 + clearance) the goal is nudged to the nearest
-    non-overlapping point;
+    (x, z + 2000). If the rover footprint there is closer than `clearance` to
+    an obstacle, or closer than `wall_clearance` to the arena edge, the goal
+    is nudged to the nearest acceptable point;
   * plans an obstacle-avoiding rectilinear path with
     rectilinear_mm.plan_rectilinear_path_ex — which maximises the route's
     MINIMUM distance to any obstacle rather than merely clearing them by the
@@ -20,7 +20,12 @@ Owns the movement logic of the demo:
     state()["plan_clearance_mm"]) — and executes it one axis-aligned leg
     at a time through T265RoverService.move_axis(axis, mm) — re-deriving each
     leg from the LIVE pose so per-move arrival error (~POS_TOL) does not
-    accumulate along the path.
+    accumulate along the path;
+  * watches the rover FOOTPRINT (the car rectangle centred on the pose) while
+    driving: within NAV_OBSTACLE_STOP_MARGIN_MM of an obstacle -> halt; inside
+    an obstacle's clearance zone, or partly outside the arena -> shortest move
+    back to a safe pose, re-plan to the same goal, continue (see _classify,
+    _recover, _drive).
 
 The T265 has exactly one owner in this process: the T265RoverService here.
 (Do not start a second T265 pose sensor thread alongside this.)
@@ -40,7 +45,7 @@ from . import tag_fusion
 if config.DEMO_ROOT not in sys.path:
     sys.path.insert(0, config.DEMO_ROOT)
 
-from rectilinear_mm import _seg_hits  # noqa: E402  (segment-vs-box test)
+from rectilinear_mm import _seg_hits, footprint_gap  # noqa: E402  (footprint geometry)
 from rectilinear_mm import (plan_rectilinear_path_ex,      # noqa: E402
                             obstacle_boxes, describe_obstacle_schema)
 from purely_control import T265RoverService       # noqa: E402
@@ -125,9 +130,8 @@ class Navigator:
 
         self._anchor_map = None
         self._obstacles = []         # canonical collision boxes; set by _load_files
-        self._bounds_slack = 0.0     # set properly by _load_files from rover_start;
-                                     # defined here so the bounds e-stop is never
-                                     # reading an undefined attribute if load fails.
+        self._obstacle_rects = []    # (x1, z1, x2, z2) of _obstacles; set by _load_files
+        self.wall_margin = 0.0       # config.json wall_clearance; set by _load_files
         self._load_files(anchor_to_start=True)
 
         # Rover-motion service (sole T265 + cmd_vel owner in this process).
@@ -294,51 +298,39 @@ class Navigator:
         # the schema is handled in exactly one place.
         obstacles = obstacle_boxes(m, pc, "collision")
         print("[nav] %s" % describe_obstacle_schema(m, pc))
-        # Inflated obstacle boxes (x1, z1, x2, z2). A rover CENTER inside one of
-        # these means the rover footprint is within `clearance` mm of the raw
-        # obstacle -- i.e. it has entered the SAFETY BUFFER. It does NOT mean the
-        # footprint overlaps the obstacle: that would need inflation by the car
-        # half-extents alone, without the clearance term. Keeping the two ideas
-        # distinct matters, because entering the buffer is a margin violation to
-        # be corrected, while overlapping the raw obstacle is a real collision.
-        mx = car_w / 2.0 + clearance
-        mz = car_l / 2.0 + clearance
-        inflated = [(o["x"] - mx, o["z"] - mz,
-                     o["x"] + o["w"] + mx, o["z"] + o["h"] + mz)
-                    for o in obstacles]
         # Detection no-target zones: the raw obstacle rectangle (map.json) grown
         # by the clear margin (config.json `clearance`). A detection that
         # projects into one of these is treated as invalid — a person can never
         # be standing inside an obstacle or its clear keep-out, so the rover
         # must not generate a target there. This is the same geometry the UI
         # already draws as the red obstacle halo.
-        exclusion = [(o["x"] - clearance, o["z"] - clearance,
-                      o["x"] + o["w"] + clearance, o["z"] + o["h"] + clearance)
+        ex = float(config.NAV_TARGET_EXCLUSION_MM)
+        exclusion = [(o["x"] - ex, o["z"] - ex, o["x"] + o["w"] + ex, o["z"] + o["h"] + ex)
                      for o in obstacles]
         start = m.get("rover_start", {})
         # Default start: bottom-edge middle, rear bumper flush with the map's
         # bottom edge (center is half a car length up from it).
         map_start = (float(start.get("x", map_w / 2)),
                      float(start.get("z", map_d - car_l / 2)))
-        # How far the CONFIGURED start pose itself protrudes past the arena
-        # edge. The planner grants a route the same allowance (see
-        # rectilinear_mm._plan), so the bounds e-stop must too, or a rover
-        # legitimately parked half-outside would stop the instant it moved.
-        # A start placed properly inside gives 0 here, making both strict.
-        bounds_slack = max(0.0,
-                           car_w / 2.0 - map_start[0],
-                           (map_start[0] + car_w / 2.0) - map_w,
-                           car_l / 2.0 - map_start[1],
-                           (map_start[1] + car_l / 2.0) - map_d)
+        wall_margin = float(pc.get("wall_clearance", 0))
+        # Safety bands (footprint distance to an obstacle's collision box):
+        #   hard halt < recover trigger < plan floor < escape target.
+        hard = float(config.NAV_OBSTACLE_STOP_MARGIN_MM)
+        tol = float(config.NAV_RECOVER_TOL_MM)
+        if not (0.0 <= hard < clearance - tol < clearance):
+            print("[nav] WARNING: safety bands out of order: hard halt %.0f mm must be "
+                  "< recover trigger %.0f mm (clearance %.0f - NAV_RECOVER_TOL_MM %.0f)"
+                  % (hard, clearance - tol, clearance, tol))
         with self._lock:
             self.map, self.plan_cfg = m, pc
             self.map_w, self.map_d = map_w, map_d
             self.car_w, self.car_l, self.clearance = car_w, car_l, clearance
-            self._inflated = inflated
             self._exclusion = exclusion
             self._obstacles = obstacles      # canonical collision boxes
+            self._obstacle_rects = [(o["x"], o["z"], o["x"] + o["w"], o["z"] + o["h"])
+                                    for o in obstacles]
+            self.wall_margin = wall_margin
             self._map_start = map_start
-            self._bounds_slack = bounds_slack
             if anchor_to_start or self._anchor_map is None:
                 self._anchor_map = map_start
 
@@ -378,9 +370,8 @@ class Navigator:
         # footprint inside the map, only the center on-map.)
         if not (0.0 <= x <= self.map_w and 0.0 <= z <= self.map_d):
             return False, "start cell is outside the map"
-        for (x1, z1, x2, z2) in self._inflated:
-            if x1 < x < x2 and z1 < z < z2:
-                return False, "start cell overlaps an obstacle keep-out"
+        if self._fp_obstacle_gap(x, z) < self.clearance:
+            return False, "start cell overlaps an obstacle keep-out"
         try:
             m = self._load_json(config.MAP_FILE)
             m["rover_start"] = {"x": round(x), "z": round(z)}
@@ -1021,17 +1012,45 @@ class Navigator:
         return {"x": x, "z": z, "yaw_deg": math.degrees(yaw)}
 
     # ------------------------------------------------------------ geometry
+    # Every rover-vs-world test below is on the rover's FOOTPRINT: the
+    # axis-aligned car rectangle (car_w along x, car_l along z) centred on the
+    # pose, never the centre point alone. The pose is the chassis turn centre
+    # (T265 lever arm already compensated), which is the footprint centre.
+    def _fp_obstacle_gap(self, x, z):
+        """Distance from the footprint at (x, z) to the nearest obstacle
+        collision box, mm (per axis, the same measure the planner inflates by;
+        negative = overlapping). +inf with no obstacles."""
+        return footprint_gap(x, z, x, z, self._obstacle_rects, self.car_w, self.car_l)
+
+    def _fp_wall_inset(self, x, z):
+        """How far the footprint at (x, z) is inside the arena, mm (distance of
+        its nearest side to the nearest edge; negative = protruding)."""
+        hx, hz = self.car_w / 2.0, self.car_l / 2.0
+        return min(x - hx, self.map_w - (x + hx), z - hz, self.map_d - (z + hz))
+
+    def _pose_ok(self, x, z, clear, wall):
+        return self._fp_obstacle_gap(x, z) >= clear and self._fp_wall_inset(x, z) >= wall
+
     def _center_free(self, x, z):
-        """True when a rover CENTERED at (x, z) overlaps no obstacle region and
-        its footprint stays inside the map."""
-        hx = self.car_w / 2.0
-        hz = self.car_l / 2.0
-        if not (hx <= x <= self.map_w - hx and hz <= z <= self.map_d - hz):
-            return False
-        for (x1, z1, x2, z2) in self._inflated:
-            if x1 < x < x2 and z1 < z < z2:
-                return False
-        return True
+        """True when a rover centred at (x, z) keeps its footprint >= clearance
+        from every obstacle and >= wall_margin inside the arena."""
+        return self._pose_ok(x, z, self.clearance, self.wall_margin)
+
+    def _classify(self, x, z):
+        """Safety state of the footprint at (x, z):
+          "hard"    within NAV_OBSTACLE_STOP_MARGIN_MM of an obstacle -> halt;
+          "recover" inside the clearance zone (gap < clearance - NAV_RECOVER_TOL_MM)
+                    or any part outside the arena -> leave by the shortest move;
+          "ok"      otherwise.
+        Obstacle tests are skipped while the operator's ignore_obstacles
+        override is on; the arena test never is. Walls never cause a halt."""
+        if not self._ignore_obstacles:
+            g = self._fp_obstacle_gap(x, z)
+            if g < float(config.NAV_OBSTACLE_STOP_MARGIN_MM):
+                return "hard"
+            if g < self.clearance - float(config.NAV_RECOVER_TOL_MM):
+                return "recover"
+        return "recover" if self._fp_wall_inset(x, z) < 0.0 else "ok"
 
     def _in_exclusion(self, x, z):
         """True when map point (x, z) falls inside a detection no-target zone
@@ -1039,49 +1058,6 @@ class Navigator:
         detections that project onto a spot where a target can never be."""
         for (x1, z1, x2, z2) in self._exclusion:
             if x1 <= x <= x2 and z1 <= z <= z2:
-                return True
-        return False
-
-    def _bounds_excess(self, x, z):
-        """How far a rover footprint centred at (x, z) protrudes past the arena
-        edge, in mm (0 = fully inside)."""
-        hx = self.car_w / 2.0
-        hz = self.car_l / 2.0
-        return max(0.0,
-                   hx - x, (x + hx) - self.map_w,
-                   hz - z, (z + hz) - self.map_d)
-
-    def _out_of_bounds(self, x, z):
-        """Emergency-stop test: True when the rover footprint has left the arena
-        by more than it was ever entitled to.
-
-        The planner keeps the footprint inside the map, so on a valid path this
-        never fires. It is the runtime backstop for the case the planner cannot
-        cover — the rover DRIFTING out, or a leg overshooting — which previously
-        had no check at all: _footprint_blocked only ever consulted obstacles,
-        so nothing stopped the rover leaving the arena entirely.
-
-        `_bounds_slack` mirrors the planner's allowance for a start pose that
-        already protrudes (e.g. parked in a corner with its centre on the corner
-        point); without it the rover would e-stop the instant it was placed."""
-        return (self._bounds_excess(x, z)
-                > self._bounds_slack + float(config.NAV_BOUNDS_STOP_MARGIN_MM))
-
-    def _footprint_blocked(self, x, z):
-        """Emergency-stop test: True when a rover centered at (x, z) has its
-        footprint (car half-extent + NAV_OBSTACLE_STOP_MARGIN_MM) overlapping a
-        RAW obstacle.
-
-        NOTE: this only fires below the planner's own margin when
-        NAV_OBSTACLE_STOP_MARGIN_MM < the clearance the route achieved (reported
-        as state()["plan_clearance_mm"]). If the stop margin is the larger of
-        the two, a perfectly valid path trips it the moment it is driven."""
-        m = float(config.NAV_OBSTACLE_STOP_MARGIN_MM)
-        hx = self.car_w / 2.0 + m
-        hz = self.car_l / 2.0 + m
-        for o in self._obstacles:
-            if (o["x"] - hx < x < o["x"] + o["w"] + hx
-                    and o["z"] - hz < z < o["z"] + o["h"] + hz):
                 return True
         return False
 
@@ -1448,7 +1424,11 @@ class Navigator:
             self._follow = False
             self._auto = False
         self.cancel()                       # stop + join any running nav
-        gx, gz = float(self._map_start[0]), float(self._map_start[1])
+        # The start cell may be flush with the arena edge (e.g. parked in a
+        # corner); as a GOAL it is moved in far enough to keep wall_margin.
+        m = self.car_w / 2.0 + self.wall_margin, self.car_l / 2.0 + self.wall_margin
+        gx = min(max(float(self._map_start[0]), m[0]), self.map_w - m[0])
+        gz = min(max(float(self._map_start[1]), m[1]), self.map_d - m[1])
         with self._lock:
             self._target = {"x": gx, "z": gz, "t": time.time(),
                             "range_m": None, "az_deg": None, "source": "home"}
@@ -1457,18 +1437,22 @@ class Navigator:
     def _plan_segments(self, plan_cfg, start, end, follow):
         """Plan a path; for FOLLOW, add corners to look from (see
         _staircase). Returns (segs, achieved_clearance, info)."""
+        # The rover may start (or stop short) a little inside the clearance
+        # zone without being in "recover" territory: allow endpoints down to
+        # the recover trigger, so such a pose is plannable instead of refused.
+        plan_cfg = dict(plan_cfg, endpoint_clearance=(
+            self.clearance - float(config.NAV_RECOVER_TOL_MM)))
         segs, achieved = plan_rectilinear_path_ex(
             self.map, plan_cfg, start, end, ignore_start_obstacle=self._ignore_obstacles)
         info = {"staircase": False}
         if not follow or segs is None or self._ignore_obstacles:
             return segs, achieved, info
-        clr = achieved if achieved is not None else float(plan_cfg.get("clearance", 0))
-        segs2 = self._staircase(start, segs, float(clr))
+        segs2 = self._staircase(start, segs)
         if len(segs2) > len(segs):
             info["staircase"] = True
         return segs2, achieved, info
 
-    def _staircase(self, start, segs, clearance):
+    def _staircase(self, start, segs):
         """More corners without extra distance. The planner always prefers the
         fewest turns (on a grid, a path with more turns is never shorter, so
         any positive turn_penalty picks the L-shape). For FOLLOW, each L-shaped
@@ -1477,20 +1461,17 @@ class Navigator:
         alternating steps: same start, same end, same total length, but a
         corner every ~MAX_LEG where the rover can stop and look.
 
-        A staircase is used only when every step keeps at least the clearance
-        the original route achieved (obstacles inflated by half the car plus
-        that clearance); otherwise fewer steps are tried, and failing that the
-        original pair is kept. Steps shorter than NAV_FOLLOW_MIN_STEP_MM are
+        A staircase is used only when its steps keep the rover footprint at
+        least as far from every obstacle as the original pair of legs did
+        (min footprint_gap); otherwise fewer steps are tried, and failing that
+        the original pair is kept. Steps stay inside the pair's bounding box,
+        so the arena margin is kept automatically. Steps shorter than NAV_FOLLOW_MIN_STEP_MM are
         never produced. A single long straight leg with no perpendicular
         neighbour is left as is (it cannot gain a corner without a detour)."""
         max_leg = float(config.NAV_FOLLOW_MAX_LEG_MM)
         min_step = float(config.NAV_FOLLOW_MIN_STEP_MM)
         if max_leg <= 0:
             return segs
-        mx = self.car_w / 2.0 + clearance
-        mz = self.car_l / 2.0 + clearance
-        boxes = [(o["x"] - mx, o["z"] - mz, o["x"] + o["w"] + mx, o["z"] + o["h"] + mz)
-                 for o in self._obstacles]
 
         def advance(pt, steps):
             x, z = pt
@@ -1501,14 +1482,14 @@ class Navigator:
                     z += d
             return (x, z)
 
-        def clear(pt, steps):
-            x, z = pt
+        def min_gap(pt, steps):
+            x, z, g = pt[0], pt[1], float("inf")
             for ax, d in steps:
                 nx, nz = (x + d, z) if ax == "x" else (x, z + d)
-                if any(_seg_hits(x, z, nx, nz, bx) for bx in boxes):
-                    return False
+                g = min(g, footprint_gap(x, z, nx, nz, self._obstacle_rects,
+                                         self.car_w, self.car_l))
                 x, z = nx, nz
-            return True
+            return g
 
         out, i, cur = [], 0, (float(start[0]), float(start[1]))
         while i < len(segs):
@@ -1519,9 +1500,10 @@ class Navigator:
                 k_want = int(math.ceil(big / max_leg)) if big > max_leg else 1
                 k_max = int(small // min_step) if min_step > 0 else k_want
                 chosen = None
+                floor = min_gap(cur, [segs[i], segs[i + 1]])
                 for k in range(min(k_want, k_max), 1, -1):
                     steps = [(ax, d / k), (bx_, e / k)] * k
-                    if clear(cur, steps):
+                    if min_gap(cur, steps) >= floor - 1e-6:
                         chosen = steps
                         break
                 steps = chosen if chosen else [segs[i], segs[i + 1]]
@@ -1544,19 +1526,44 @@ class Navigator:
             with self._lock:
                 self._goal, self._status, self._message = goal, "arrived", "already at the goal"
             return True, "already at the goal"
-        start = (round(p["x"]), round(p["z"]))
-        end = (round(goal["x"]), round(goal["z"]))
         with self._lock:
             self._goal = goal
             self._status, self._message = "planning", ""
             self._path, self._leg = None, 0
-        # The planner maximises the route's MINIMUM distance to any obstacle
-        # (not just the configured minimum) and reports what it achieved, so the
-        # UI/operator can see how much margin this particular route really has.
-        # Odometry error since the last known-good pose earns extra planning
-        # margin, so routes are held further off obstacles the longer it has
-        # been since a fix. Applied as a raised clearance FLOOR; the planner's
-        # own max-min search still pushes above it wherever geometry allows.
+            self._drive_outcome = None
+        state = self._classify(p["x"], p["z"])
+        if state == "hard":
+            with self._lock:
+                self._status = "blocked"
+                self._message = ("rover footprint is within %.0f mm of an obstacle; use "
+                                 "Ignore obstacles to drive out" % float(config.NAV_OBSTACLE_STOP_MARGIN_MM))
+            return False, self._message
+        wps = None
+        if state == "ok":
+            wps = self._plan_waypoints(goal, follow, p)
+            if wps is None:
+                return False, self._message
+        else:
+            # Inside a clearance zone or partly outside the arena: the drive
+            # thread first returns to a safe pose, then plans (see _drive).
+            with self._lock:
+                self._status, self._message = "moving", "returning to a safe position before planning"
+        self._cancel.clear()
+        self._nav_thread = threading.Thread(target=self._drive, args=(goal, follow, wps),
+                                            daemon=True)
+        self._nav_thread.start()
+        return True, (f"navigating: {len(wps)} leg(s)" if wps else "navigating (recovering first)")
+
+    def _plan_waypoints(self, goal, follow, p):
+        """Plan from pose p to goal. Publishes the path for the UI and returns
+        absolute map waypoints, or None (status/message set) when no path.
+
+        The planner maximises the route's clearance (see rectilinear_mm).
+        Odometry error since the last known-good pose earns extra planning
+        margin, applied as a raised clearance FLOOR; if that margin alone makes
+        the goal unreachable, the configured clearance is used instead."""
+        start = (round(p["x"]), round(p["z"]))
+        end = (round(goal["x"]), round(goal["z"]))
         drift_mm = self._drift_margin_mm()
         plan_cfg = self.plan_cfg
         if drift_mm > 0.0:
@@ -1564,17 +1571,13 @@ class Navigator:
             plan_cfg["clearance"] = float(plan_cfg.get("clearance", 0)) + drift_mm
         segs, achieved, pinfo = self._plan_segments(plan_cfg, start, end, follow)
         if segs is None and drift_mm > 0.0:
-            # The drift margin alone made this unreachable. Fall back to the
-            # configured clearance rather than refusing to move: a conservative
-            # margin must never be the reason the rover strands itself.
             segs, achieved, pinfo = self._plan_segments(self.plan_cfg, start, end, follow)
         if segs is None:
             with self._lock:
                 self._status = "no_path"
                 self._message = "planner found no obstacle-free rectilinear path"
                 self._plan_clearance = None
-            return False, self._message
-        # Segments -> absolute waypoints (so each leg can be re-derived live).
+            return None
         wps, cx, cz = [], float(start[0]), float(start[1])
         for axis, d in segs:
             if axis == "x":
@@ -1586,139 +1589,245 @@ class Navigator:
             self._path = [[round(start[0]), round(start[1])]] + [[round(x), round(z)] for x, z in wps]
             self._plan_clearance = achieved
             self._status = "moving"
-            self._drive_outcome = None
             self._plan_info = dict(pinfo, legs=len(wps),
                                    longest_mm=round(max(abs(float(d)) for _, d in segs)))
-        self._cancel.clear()
-        self._nav_thread = threading.Thread(target=self._drive, args=(wps,), daemon=True)
-        self._nav_thread.start()
-        return True, f"navigating: {len(wps)} leg(s)"
+        return wps
 
-    def _drive(self, waypoints):
-        try:
-            driven = 0                      # legs actually driven so far
-            for i, (wx, wz) in enumerate(waypoints):
-                with self._lock:
-                    self._leg = i + 1
-                # Re-derive this leg from the LIVE pose so per-move arrival
-                # error does not accumulate across legs.
-                p = self.pose()
-                if p is None:
-                    raise RuntimeError("lost rover pose")
-                self._drift_accumulate(p)
-                dx = wx - p["x"]
-                dz = wz - p["z"]
-                # Residual already inside the arrival tolerance: driving it would
-                # satisfy POS_TOL immediately and still burn SETTLE_TIME for
-                # nothing. Skipping is safe because the NEXT leg is re-derived
-                # from the live pose, and for the final leg the residual is
-                # within tolerance by definition.
-                leg_mm = math.hypot(dx, dz)
-                if leg_mm < float(config.NAV_POS_TOL) * 1000.0:
+    # ------------------------------------------------------------ driving + safety
+    def _to_body(self, dx, dz, yaw_deg):
+        """Map-frame delta (mm) -> the move's own start-heading frame
+        (right, forward), so a move lands on its map target even when the
+        rover's heading has drifted."""
+        g = math.radians(yaw_deg)
+        mr, mf = dx, -dz                  # map delta as (right, forward)
+        return (mr * math.cos(g) + mf * math.sin(g),
+                -mr * math.sin(g) + mf * math.cos(g))
+
+    def _halt(self, lp):
+        """Hard stop: the footprint came within NAV_OBSTACLE_STOP_MARGIN_MM of
+        an obstacle. The only case that still halts."""
+        self.rover.stop()
+        self._cancel.set()
+        with self._lock:
+            self._status = "blocked"
+            self._message = ("E-STOP: rover footprint %.0f mm from an obstacle at (%.0f, %.0f) mm"
+                             % (max(0.0, self._fp_obstacle_gap(lp["x"], lp["z"])),
+                                lp["x"], lp["z"]))
+
+    def _run_move(self, right_mm, forward_mm, recover_ok):
+        """Drive one straight move while polling the footprint at ~20 Hz.
+        Returns (outcome, result): "done" (result = MoveResult), "cancel",
+        "hard" (halted, status set), or "recover" (stopped because the
+        footprint entered a clearance zone / left the arena; only when
+        recover_ok -- a recovery move itself is exempt, as it starts there)."""
+        # Hold true map-forward (the T265 yaw that == anchor heading) so the
+        # rover corrects accumulated yaw drift WHILE driving.
+        with self._lock:
+            hold_yaw = self._anchor_pose["yaw"] if self._anchor_pose else None
+        mv = self.rover.move(right=right_mm, forward=forward_mm, units="mm",
+                             hold_yaw=hold_yaw, blocking=False)
+        while self.rover.is_busy():
+            if self._cancel.is_set() or self._stop.is_set():
+                self.rover.stop()
+                return "cancel", None
+            lp = self.pose()
+            if lp is not None:
+                st = self._classify(lp["x"], lp["z"])
+                if st == "hard":
+                    self._halt(lp)
+                    return "hard", None
+                if st == "recover" and recover_ok:
+                    self.rover.stop()
+                    return "recover", None
+            self._stop.wait(0.05)   # ~20 Hz safety poll
+        return "done", self.rover.wait(mv)
+
+    def _recovery_target(self, x, z):
+        """Shortest straight move out of a clearance zone and/or back inside
+        the arena: a target whose footprint is >= clearance + NAV_RECOVER_TOL_MM
+        from every obstacle and >= wall_margin inside the arena, reached by a
+        straight move whose sweeping footprint never comes within
+        NAV_OBSTACLE_STOP_MARGIN_MM of an obstacle (exact: the centre segment
+        vs obstacles grown by the car half-extents + that margin). Searches 16
+        directions in 10 mm steps up to NAV_RECOVER_MAX_MM, axis-aligned first
+        on ties. Returns (tx, tz) or None."""
+        clear_t = self.clearance + float(config.NAV_RECOVER_TOL_MM)
+        hard = float(config.NAV_OBSTACLE_STOP_MARGIN_MM)
+        hx, hz = self.car_w / 2.0 + hard, self.car_l / 2.0 + hard
+        grown = [] if self._ignore_obstacles else [
+            (x1 - hx, z1 - hz, x2 + hx, z2 + hz) for (x1, z1, x2, z2) in self._obstacle_rects]
+        dirs = [(math.cos(math.radians(a)), math.sin(math.radians(a)))
+                for a in (0, 90, 180, 270, 45, 135, 225, 315,
+                          22.5, 67.5, 112.5, 157.5, 202.5, 247.5, 292.5, 337.5)]
+        step = 10.0
+        for k in range(1, int(float(config.NAV_RECOVER_MAX_MM) / step) + 1):
+            d = k * step
+            for ux, uz in dirs:
+                tx, tz = x + ux * d, z + uz * d
+                if self._fp_wall_inset(tx, tz) < self.wall_margin:
                     continue
-                if self._cancel.is_set():
-                    return
-                # FOLLOW corner check: the rover is stopped at a corner of the
-                # plan, the only place it may pause. Look again if it has been
-                # blind too long, and end this drive here if the target has
-                # moved enough to need a new plan (see _corner_check).
-                if driven > 0 and self._corner_check(i, waypoints) == "replan":
-                    with self._lock:
-                        self._drive_outcome = "replan"
-                        self._status = "arrived"
-                        self._message = "follow: re-planning at corner"
-                    return
-                # Zero-velocity drift sample: the rover is stopped between legs,
-                # so its TRUE velocity is zero and any pose change the T265
-                # reports here is drift, measured directly.
-                self._zupt_sample()
-                # Absolute (tag) correction is no longer forced HERE. It runs
-                # as its own continuous background service (_monitor_loop),
-                # applying whenever the rover happens to be stationary rather
-                # than being woven into this leg's critical path. Navigation
-                # just reads self.pose() -- above and on the next leg -- which
-                # already carries whatever the localisation service has
-                # applied so far. Same gates, same consensus/RMS/spread
-                # thresholds, same eased-in correction: only WHEN it runs has
-                # changed, never what it does or how cautious it is.
-                # Tracking-confidence gate: Low confidence is exactly when VIO
-                # drift accrues fastest. Wait briefly for it to recover; if it
-                # doesn't, still go (never strand a demo) but at reduced speed.
-                self._await_confidence()
-                # Map-frame delta -> the move's own start-heading frame: rotate
-                # by -(yaw relative to anchor) so the leg lands on the map
-                # waypoint even when the rover's heading has drifted. One
-                # mecanum move per waypoint (handles both axes + residuals).
-                g = math.radians(p["yaw_deg"])
-                mr, mf = dx, -dz              # map delta as (right, forward)
-                cr = mr * math.cos(g) + mf * math.sin(g)
-                cf = -mr * math.sin(g) + mf * math.cos(g)
-                # Hold true map-forward (the T265 yaw that == anchor heading)
-                # so the rover corrects accumulated yaw drift WHILE driving this
-                # leg, instead of locking in whatever heading it started with.
-                with self._lock:
-                    hold_yaw = self._anchor_pose["yaw"] if self._anchor_pose else None
-                # Run the leg non-blocking so we can poll an obstacle safety check
-                # at ~20 Hz while it drives, and e-stop if the footprint enters a
-                # keep-out (a wrong plan/target or pose drift would otherwise let
-                # the rover plough into an obstacle).
-                goal = self.rover.move(right=cr, forward=cf, units="mm",
-                                       hold_yaw=hold_yaw, blocking=False)
-                while self.rover.is_busy():
-                    if self._cancel.is_set() or self._stop.is_set():
-                        self.rover.stop()
-                        return
-                    lp = self.pose()
-                    if lp is not None and self._out_of_bounds(lp["x"], lp["z"]):
-                        # Bounds violations are NOT suppressed by
-                        # ignore_obstacles: that override exists to let the rover
-                        # drive out of an obstacle keep-out it is already inside,
-                        # which is a deliberate recovery. Leaving the arena is
-                        # never a recovery, so this stop is unconditional.
-                        self.rover.stop()
-                        self._cancel.set()
-                        with self._lock:
-                            self._status = "blocked"
-                            self._message = ("E-STOP: rover footprint left the arena "
-                                             "at (%.0f, %.0f) mm — %.0f mm past the edge"
-                                             % (lp["x"], lp["z"],
-                                                self._bounds_excess(lp["x"], lp["z"])))
-                        return
-                    if (not self._ignore_obstacles and lp is not None
-                            and self._footprint_blocked(lp["x"], lp["z"])):
-                        self.rover.stop()
-                        self._cancel.set()
-                        with self._lock:
-                            self._status = "blocked"
-                            self._message = ("E-STOP: rover footprint entered an obstacle "
-                                             "zone at (%.0f, %.0f) mm" % (lp["x"], lp["z"]))
-                        return
-                    self._stop.wait(0.05)   # ~20 Hz safety poll
-                res = self.rover.wait(goal)
-                if self._cancel.is_set():
-                    return
-                # Per-leg fidelity log: commanded vs achieved displacement. A
-                # consistent ratio across many legs indicates a fixed VIO SCALE
-                # error (correctable); random scatter indicates slip or noise.
-                self._log_leg(i + 1, leg_mm, wx, wz, res)
-                driven += 1
-                if res is None or not res:
-                    reason = res.reason if res is not None else "no result"
-                    with self._lock:
-                        self._status = "error"
-                        self._message = (f"leg {i + 1} ({dx:+.0f}, {dz:+.0f})mm "
-                                         f"failed ({reason})")
-                        # Clear slate: drop the dead plan so this failed/incomplete
-                        # move leaves no residual goal/path behind it — the next
-                        # navigate call (manual, AUTO, or FOLLOW) starts fresh
-                        # instead of being queued behind stale state.
-                        self._goal, self._path, self._leg = None, None, 0
-                    return
+                if not self._ignore_obstacles and self._fp_obstacle_gap(tx, tz) < clear_t:
+                    continue
+                if any(_seg_hits(x, z, tx, tz, b) for b in grown):
+                    continue
+                return tx, tz
+        return None
+
+    def _recover(self, p):
+        """Leave a clearance zone / return inside the arena by the shortest
+        straight move, then report whether the rover is back in a safe pose.
+        On failure the status says why and the navigation ends."""
+        x, z = p["x"], p["z"]
+        inset = self._fp_wall_inset(x, z)
+        why = ("returning inside the arena (%.0f mm outside)" % -inset if inset < 0.0 else
+               "leaving obstacle clearance zone (%.0f mm from obstacle)"
+               % self._fp_obstacle_gap(x, z))
+        target = self._recovery_target(x, z)
+        if target is None:
+            self.rover.stop()
+            self._cancel.set()
             with self._lock:
-                self._status, self._message = "arrived", ""
+                self._status = "blocked"
+                self._message = "%s: no clear move within %.0f mm" % (
+                    why, float(config.NAV_RECOVER_MAX_MM))
+            return False
+        with self._lock:
+            self._message = why
+        cr, cf = self._to_body(target[0] - x, target[1] - z, p["yaw_deg"])
+        out, res = self._run_move(cr, cf, recover_ok=False)
+        if out != "done":
+            return False
+        if res is None or not res:
+            with self._lock:
+                self._status = "error"
+                self._message = "%s: move failed (%s)" % (
+                    why, res.reason if res is not None else "no result")
+            return False
+        return True
+
+    def _drive(self, goal, follow, waypoints):
+        """Navigation thread: drive the plan; whenever the footprint enters a
+        clearance zone or leaves the arena, stop, return to a safe pose by the
+        shortest move, re-plan from there to the SAME goal, and continue.
+        At most NAV_RECOVER_MAX_TRIES recoveries per navigation."""
+        try:
+            recovers = 0
+            while True:
+                if waypoints is None:
+                    p = self.pose()
+                    if p is None:
+                        raise RuntimeError("lost rover pose")
+                    state = self._classify(p["x"], p["z"])
+                    if state == "hard":
+                        self._halt(p)
+                        return
+                    if state == "recover":
+                        if recovers >= int(config.NAV_RECOVER_MAX_TRIES):
+                            self.rover.stop()
+                            with self._lock:
+                                self._status = "blocked"
+                                self._message = ("gave up after %d recoveries; still outside "
+                                                 "a safe position" % recovers)
+                            return
+                        recovers += 1
+                        if not self._recover(p):
+                            return
+                        continue
+                    waypoints = self._plan_waypoints(goal, follow, p)
+                    if waypoints is None:
+                        return
+                if self._drive_legs(waypoints) != "recover":
+                    return
+                waypoints = None
         except Exception as exc:
             with self._lock:
                 self._status, self._message = "error", str(exc)
+
+    def _drive_legs(self, waypoints):
+        """Drive the planned legs. Returns "arrived", "replan" (FOLLOW corner),
+        "recover" (safety zone entered: _drive recovers and re-plans),
+        "cancel", "hard", or "error"."""
+        driven = 0                      # legs actually driven so far
+        for i, (wx, wz) in enumerate(waypoints):
+            with self._lock:
+                self._leg = i + 1
+            # Re-derive this leg from the LIVE pose so per-move arrival
+            # error does not accumulate across legs.
+            p = self.pose()
+            if p is None:
+                raise RuntimeError("lost rover pose")
+            state = self._classify(p["x"], p["z"])
+            if state == "hard":
+                self._halt(p)
+                return "hard"
+            if state == "recover":
+                return "recover"
+            self._drift_accumulate(p)
+            dx = wx - p["x"]
+            dz = wz - p["z"]
+            # Residual already inside the arrival tolerance: driving it would
+            # satisfy POS_TOL immediately and still burn SETTLE_TIME for
+            # nothing. Skipping is safe because the NEXT leg is re-derived
+            # from the live pose, and for the final leg the residual is
+            # within tolerance by definition.
+            leg_mm = math.hypot(dx, dz)
+            if leg_mm < float(config.NAV_POS_TOL) * 1000.0:
+                continue
+            if self._cancel.is_set():
+                return "cancel"
+            # FOLLOW corner check: the rover is stopped at a corner of the
+            # plan, the only place it may pause. Look again if it has been
+            # blind too long, and end this drive here if the target has
+            # moved enough to need a new plan (see _corner_check).
+            if driven > 0 and self._corner_check(i, waypoints) == "replan":
+                with self._lock:
+                    self._drive_outcome = "replan"
+                    self._status = "arrived"
+                    self._message = "follow: re-planning at corner"
+                return "replan"
+            # Zero-velocity drift sample: the rover is stopped between legs,
+            # so its TRUE velocity is zero and any pose change the T265
+            # reports here is drift, measured directly.
+            self._zupt_sample()
+            # Absolute (tag) correction is no longer forced HERE. It runs
+            # as its own continuous background service (_monitor_loop),
+            # applying whenever the rover happens to be stationary rather
+            # than being woven into this leg's critical path. Navigation
+            # just reads self.pose() -- above and on the next leg -- which
+            # already carries whatever the localisation service has
+            # applied so far. Same gates, same consensus/RMS/spread
+            # thresholds, same eased-in correction: only WHEN it runs has
+            # changed, never what it does or how cautious it is.
+            # Tracking-confidence gate: Low confidence is exactly when VIO
+            # drift accrues fastest. Wait briefly for it to recover; if it
+            # doesn't, still go (never strand a demo) but at reduced speed.
+            self._await_confidence()
+            # One mecanum move per waypoint, in the move's start-heading frame
+            # and holding true map-forward (see _to_body / _run_move). The
+            # footprint is checked at ~20 Hz while it drives.
+            cr, cf = self._to_body(dx, dz, p["yaw_deg"])
+            out, res = self._run_move(cr, cf, recover_ok=True)
+            if out != "done":
+                return out
+            if self._cancel.is_set():
+                return "cancel"
+            # Per-leg fidelity log: commanded vs achieved displacement. A
+            # consistent ratio across many legs indicates a fixed VIO SCALE
+            # error (correctable); random scatter indicates slip or noise.
+            self._log_leg(i + 1, leg_mm, wx, wz, res)
+            driven += 1
+            if res is None or not res:
+                reason = res.reason if res is not None else "no result"
+                with self._lock:
+                    self._status = "error"
+                    self._message = (f"leg {i + 1} ({dx:+.0f}, {dz:+.0f})mm "
+                                     f"failed ({reason})")
+                    # Clear slate: the next navigate call starts fresh.
+                    self._goal, self._path, self._leg = None, None, 0
+                return "error"
+        with self._lock:
+            self._status, self._message = "arrived", ""
+        return "arrived"
 
     def cancel(self):
         self._cancel.set()
@@ -1794,10 +1903,11 @@ class Navigator:
     def set_ignore_obstacles(self, enabled):
         """Operator override: when enabled, the rover's OWN current position
         being inside an obstacle/clearance zone never blocks starting a plan
-        (rectilinear_mm's start-blocked check) or continuing a move (the
-        mid-move footprint e-stop in _drive). Obstacle avoidance elsewhere
-        (routing around every obstacle, the standoff-goal search near the
-        target) is unaffected. Takes effect immediately, including mid-move."""
+        (rectilinear_mm's start-blocked check), and the mid-move obstacle
+        checks (hard halt and clearance-zone recovery, see _classify) are off.
+        Keeping the footprint inside the arena is NOT affected. Obstacle
+        avoidance elsewhere (routing around every obstacle, the standoff-goal
+        search) is unaffected. Takes effect immediately, including mid-move."""
         with self._lock:
             self._ignore_obstacles = bool(enabled)
         return self._ignore_obstacles
@@ -2096,6 +2206,7 @@ class Navigator:
             "jog_speed": round(float(self._jog_speed), 3),
             "jog_speed_min": float(config.NAV_JOG_SPEED_MIN),
             "jog_speed_max": float(config.NAV_JOG_SPEED_MAX),
+            "wall_margin": float(self.wall_margin),
             "avg_n": int(config.NAV_TARGET_AVG_N),
             "avg_n_min": int(config.NAV_TARGET_AVG_N_MIN),
             "avg_n_max": int(config.NAV_TARGET_AVG_N_MAX),
@@ -2154,11 +2265,10 @@ class Navigator:
             "goal": goal,
             "path": path,
             "leg": leg,
-            # mm: the minimum body-to-obstacle distance this route achieves.
-            # The planner maximises it, so it is normally well above the
-            # configured `clearance` floor. Compare against
-            # NAV_OBSTACLE_STOP_MARGIN_MM: a value at or below that margin means
-            # the route runs close enough to trip the mid-move e-stop.
+            # mm: the smallest footprint-to-obstacle distance along this route.
+            # The planner maximises it and never plans below config.json's
+            # `clearance` (except right at a start/goal pose, down to the
+            # recover trigger).
             "plan_clearance_mm": (round(plan_clearance)
                                   if plan_clearance is not None else None),
             # Drift diagnostics. pose_jumps counts T265 steps REJECTED as
