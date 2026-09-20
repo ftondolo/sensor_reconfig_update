@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Rover Map Navigation — Live</title>
-  <link rel="stylesheet" href="/static/audience.css?v=demo14" />
+  <link rel="stylesheet" href="/static/audience.css?v=demo15" />
 </head>
 <body>
   <header class="topbar">
@@ -48,12 +48,14 @@
       <div class="cam-card" id="card-rgb">
         <div class="cam-head"><span>RGB + Detection</span><span id="st-detector" class="badge">—</span></div>
         <div class="cam-body"><img id="detect-img" class="cam-img" alt="rgb + detections" />
-          <div id="ovl-rgb" class="timing-ovl" hidden></div></div>
+          <div id="ovl-rgb" class="timing-ovl" hidden></div>
+          <canvas id="plot-rgb" class="timing-plot" hidden></canvas></div>
       </div>
       <div class="cam-card" id="card-thermal">
         <div class="cam-head"><span>Thermal (FLIR)</span><span id="st-flir_thermal" class="badge">—</span></div>
         <div class="cam-body"><img id="thermal-img" class="cam-img" alt="thermal" />
-          <div id="ovl-thermal" class="timing-ovl" hidden></div></div>
+          <div id="ovl-thermal" class="timing-ovl" hidden></div>
+          <canvas id="plot-thermal" class="timing-plot" hidden></canvas></div>
       </div>
       <div class="cam-card">
         <div class="cam-head"><span>Depth (D435i)</span><span id="st-d435i_rgb" class="badge">—</span></div>
@@ -145,6 +147,6 @@
   </main>
 
   <script src="/static/map_view.js?v=demo12"></script>
-  <script src="/static/audience.js?v=demo16"></script>
+  <script src="/static/audience.js?v=demo17"></script>
 </body>
 </html>
