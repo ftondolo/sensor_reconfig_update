@@ -201,39 +201,39 @@ NAV_TARGET_FORGET_S = _env("NAV_TARGET_FORGET_S", 5.0)
 NAV_TRACK_UPDATE_S = _env("NAV_TRACK_UPDATE_S", 0.05)
 # Removed 2026-09-18 with the running average: NAV_TARGET_WINDOW_S (median
 # window), NAV_TARGET_RELOCK_S, NAV_TARGET_CONFIRM_N, NAV_TARGET_SNR_TOL.
-# Emergency stop: while moving, if the rover footprint (car half-extent + this
-# margin) overlaps a RAW obstacle, cancel the move and stop immediately.
+# ---- rover footprint safety (all tests use the car RECTANGLE, not its centre) --
+# The rover is the axis-aligned car rectangle from config.json (car.width along
+# x, car.length along z) centred on its pose. Distances below are from that
+# rectangle to an obstacle's collision box (panel + stabiliser feet), measured
+# per axis like the red halo on the map. Bands, which must stay ordered:
+#   hard halt  <  recover trigger  <  plan floor  <  recovery target
+#   NAV_OBSTACLE_STOP_MARGIN_MM  <  clearance - NAV_RECOVER_TOL_MM  <  clearance
+#                                <  clearance + NAV_RECOVER_TOL_MM
+# (clearance = config.json `clearance`, 150 mm). Walls: any part of the
+# footprint outside the arena -> recover, back to >= config.json
+# `wall_clearance` (50 mm) inside. Walls never cause a halt.
 #
-# IMPORTANT — this margin and config.json's `clearance` must be ordered:
-# a planned path holds the car body `clearance` mm off every obstacle, and this
-# e-stop fires when the body comes within NAV_OBSTACLE_STOP_MARGIN_MM of one.
-# So a valid path only avoids tripping the e-stop when
-#     clearance  >  NAV_OBSTACLE_STOP_MARGIN_MM.
-# With clearance below this value, a path planned at the base clearance trips
-# the stop the moment it is driven. The clearance-maximising search below
-# mitigates that (it raises the achieved clearance wherever the geometry
-# allows, and reports what it achieved), but the ordering is still worth
-# fixing in config.json.
-NAV_OBSTACLE_STOP_MARGIN_MM = _env("NAV_OBSTACLE_STOP_MARGIN_MM", 150)
-# Clearance-maximising planner (rectilinear_mm): rather than planning once at
-# config.json's `clearance`, binary-search the LARGEST clearance that still
-# admits a path, so the route keeps as far from obstacles as the arena allows.
-# Feasibility is monotonic in clearance (inflating obstacles can only shrink
-# free space), so the largest feasible value IS the max-min clearance.
-# NAV_PLAN_MAX_CLEARANCE_MM caps how much detour is worth buying; the search
-# resolution is NAV_PLAN_CLEARANCE_TOL_MM. Set MAX <= the base clearance to
-# disable the search and plan exactly as before.
-NAV_PLAN_MAX_CLEARANCE_MM = _env("NAV_PLAN_MAX_CLEARANCE_MM", 400)
-NAV_PLAN_CLEARANCE_TOL_MM = _env("NAV_PLAN_CLEARANCE_TOL_MM", 10)
-# Arena-bounds emergency stop. The planner keeps the rover FOOTPRINT inside the
-# map, so on a valid path this never fires; it is the runtime backstop for the
-# rover drifting out or a leg overshooting. Measured as protrusion past the
-# arena edge, beyond whatever the configured rover_start already protrudes
-# (a rover parked in a corner with its centre on the corner point protrudes by
-# half its size, and must not e-stop just for sitting there).
-# Unlike the obstacle e-stop this is NOT suppressed by ignore_obstacles:
-# driving out of a keep-out is a legitimate recovery, leaving the arena is not.
-NAV_BOUNDS_STOP_MARGIN_MM = _env("NAV_BOUNDS_STOP_MARGIN_MM", 100)
+# HARD HALT: while moving, the footprint within this distance of an obstacle ->
+# stop and stay stopped (the only e-stop left). A fixed buffer: the footprint is
+# checked at ~20 Hz on the CURRENT pose, so 30 mm suits speeds up to ~0.3 m/s;
+# at higher speed-slider settings the rover can cover more than this between a
+# check and standing still.
+NAV_OBSTACLE_STOP_MARGIN_MM = _env("NAV_OBSTACLE_STOP_MARGIN_MM", 30)
+# RECOVER: footprint closer than (clearance - this) to an obstacle, or partly
+# outside the arena -> stop, take the shortest straight move back to a safe pose
+# (>= clearance + this from obstacles, >= wall_clearance inside the arena,
+# never sweeping through the hard-halt buffer), re-plan to the same goal and
+# continue. The tolerance absorbs normal path-tracking error.
+NAV_RECOVER_TOL_MM = _env("NAV_RECOVER_TOL_MM", 25)
+NAV_RECOVER_MAX_MM = _env("NAV_RECOVER_MAX_MM", 400)    # longest recovery move searched
+NAV_RECOVER_MAX_TRIES = _env("NAV_RECOVER_MAX_TRIES", 3)  # per navigation, then halt
+# Detection no-target zone around each obstacle (a projected person inside it is
+# ignored). Kept separate from the rover clearance so raising the clearance does
+# not widen it (it used to follow config.json `clearance`, then 75 mm).
+NAV_TARGET_EXCLUSION_MM = _env("NAV_TARGET_EXCLUSION_MM", 75)
+# Planner clearance settings live in config.json: clearance (floor),
+# max_clearance, preferred_clearance, clearance_weight, wall_clearance,
+# turn_penalty (see rectilinear_mm.plan_rectilinear_path_ex).
 # purely_control wiring (passed through to T265RoverService).
 NAV_CMD_VEL_TOPIC = _env("NAV_CMD_VEL_TOPIC", "/cmd_vel")
 NAV_MAX_LINEAR = _env("NAV_MAX_LINEAR", 0.25)   # m/s translation cap during moves (initial)
