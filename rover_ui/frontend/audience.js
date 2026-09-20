@@ -258,11 +258,19 @@ function applyStatus(status) {
 // to browser time before comparing with the live UI clock.
 const TS_VIEWS = {
   rgb:     { img: "detect-img",  plain: "/stream/detect",         ts: "/stream/detect_ts",
-             ovl: "ovl-rgb",     label: "RGB" },
+             ovl: "ovl-rgb",     plot: "plot-rgb",     label: "RGB" },
   thermal: { img: "thermal-img", plain: "/stream/detect_thermal", ts: "/stream/detect_thermal_ts",
-             ovl: "ovl-thermal", label: "THERMAL" },
+             ovl: "ovl-thermal", plot: "plot-thermal", label: "THERMAL" },
 };
 let overlayOn = false;
+// Delay history plot (frame->screen), drawn along the bottom edge of each
+// image. The plot's width always stands for PLOT_WINDOW_MS: it grows rightward
+// from the moment the overlay is switched on, then scrolls left once 60 s of
+// history exist. One sample per displayed frame, kept only in this browser.
+const PLOT_WINDOW_MS = 60000;
+const PLOT_H = 36;            // CSS px
+const PLOT_GAP_MS = 1000;     // break the line across stalls longer than this
+let plotT0 = null;            // when the overlay (and the history) started
 const clockSync = { offset: null, rtt: null, timer: null };
 let ovlTimer = null;
 
@@ -350,11 +358,67 @@ function showTsFrame(v, head, jpg) {
     boxSrc: hdrMs(head, "X-Box-Src-T"), render: hdrMs(head, "X-Render-T"),
     send: hdrMs(head, "X-Send-T"), shown: null,
   };
-  img.onload = () => { meta.shown = Date.now(); v.last = meta; };
+  img.onload = () => {
+    meta.shown = Date.now();
+    v.last = meta;
+    const frame = toLocalMs(meta.frame);
+    if (frame != null && v.hist) {
+      v.hist.push({ t: meta.shown, v: Math.max(0, meta.shown - frame) });
+      while (v.hist.length && v.hist[0].t < meta.shown - PLOT_WINDOW_MS) v.hist.shift();
+    }
+  };
   const prev = v.url;
   v.url = url;
   img.src = url;
   if (prev) setTimeout(() => URL.revokeObjectURL(prev), 1000);
+}
+
+function niceCeil(ms) {
+  for (const s of [50, 100, 200, 250, 500, 1000, 2000, 2500, 5000]) if (ms <= s) return s;
+  return Math.ceil(ms / 5000) * 5000;
+}
+
+function drawPlot(v, now) {
+  const img = $(v.img), cv = $(v.plot);
+  const nw = img.naturalWidth, nh = img.naturalHeight;
+  const ew = img.clientWidth, eh = img.clientHeight;
+  if (!nw || !nh || !ew || !eh) return;
+  // The <img> letterboxes the picture (object-fit: contain): find the picture
+  // itself inside the element, and pin the plot to ITS bottom edge.
+  const sc = Math.min(ew / nw, eh / nh);
+  const dw = nw * sc, dh = nh * sc;
+  const w = Math.max(40, Math.round(dw - 12)), h = PLOT_H;
+  const left = Math.round(img.offsetLeft + (ew - dw) / 2 + 6);
+  const top = Math.round(img.offsetTop + (eh - dh) / 2 + dh - h - 4);
+  const dpr = window.devicePixelRatio || 1;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+    cv.style.width = w + "px"; cv.style.height = h + "px";
+  }
+  cv.style.left = left + "px"; cv.style.top = top + "px";
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const x0 = Math.max(plotT0 || now, now - PLOT_WINDOW_MS);   // left edge time
+  const pts = (v.hist || []).filter((p) => p.t >= x0);
+  if (!pts.length) return;
+  const vmax = Math.max(...pts.map((p) => p.v));
+  const ymax = niceCeil(Math.max(vmax, 1));
+  const labelH = 11, x = (t) => (t - x0) * w / PLOT_WINDOW_MS;
+  const y = (d) => h - 1.5 - Math.min(d, ymax) / ymax * (h - labelH - 3);
+  ctx.beginPath();
+  pts.forEach((p, i) => {
+    if (i === 0 || p.t - pts[i - 1].t > PLOT_GAP_MS) ctx.moveTo(x(p.t), y(p.v));
+    else ctx.lineTo(x(p.t), y(p.v));
+  });
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = "rgba(0, 0, 0, .55)"; ctx.lineWidth = 3; ctx.stroke();       // contrast edge
+  ctx.strokeStyle = "rgba(230, 237, 243, .95)"; ctx.lineWidth = 1.5; ctx.stroke();
+  const label = `frame→screen max ${Math.round(vmax)} ms`;
+  ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+  ctx.textAlign = "right"; ctx.textBaseline = "top";
+  ctx.lineWidth = 3; ctx.strokeStyle = "rgba(0, 0, 0, .7)"; ctx.strokeText(label, w - 1, 0);
+  ctx.fillStyle = "#e6edf3"; ctx.fillText(label, w - 1, 0);
 }
 
 function renderOverlays() {
@@ -383,6 +447,7 @@ function renderOverlays() {
     lines.push(clockSync.offset == null ? "clock Δ syncing…"
       : `clock Δ ${clockSync.offset >= 0 ? "+" : ""}${Math.round(clockSync.offset)} ms (rtt ${Math.round(clockSync.rtt)})`);
     el.textContent = lines.join("\n");
+    drawPlot(v, now);
   }
 }
 
@@ -391,6 +456,8 @@ function setOverlay(on) {
   for (const key of Object.keys(TS_VIEWS)) {
     const v = TS_VIEWS[key];
     $(v.ovl).hidden = !overlayOn;
+    $(v.plot).hidden = !overlayOn;
+    v.hist = [];                            // history restarts with the overlay
     if (overlayOn) {
       v.last = null;
       startTsView(key);
@@ -404,6 +471,7 @@ function setOverlay(on) {
   }
   clearInterval(clockSync.timer); clearInterval(ovlTimer);
   clockSync.timer = ovlTimer = null;
+  plotT0 = overlayOn ? Date.now() : null;
   if (overlayOn) {
     syncClock();
     clockSync.timer = setInterval(syncClock, 15000);
