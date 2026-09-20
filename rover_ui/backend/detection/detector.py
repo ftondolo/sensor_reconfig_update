@@ -569,62 +569,104 @@ class DetectorThread(SensorThread):
             g = 255 - g
         return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
 
+    # ---- async render loop (drives /stream/detect at ~30 fps) ----------
     def _render_loop(self):
         last = None
         while not self._render_stop.is_set() and not self._stop.is_set():
             t_start = time.time()
             rgb, _, rgb_meta = self._rgb_sensor.raw.get_meta()
             if rgb is None or self._tracker is None:
-                self._render_stop.wait(0.02); continue
+                self._render_stop.wait(0.02)
+                continue
             with self._slock:
                 settings = self._last_settings
                 dets = self._disp_dets          # smoothed single det (read_once owns it)
                 tgt = self._disp_target
                 bm = dict(self._box_meta) if self._box_meta else {}
             if settings is None:
-                self._render_stop.wait(0.02); continue
+                self._render_stop.wait(0.02)
+                continue
             rgb = np.ascontiguousarray(rgb)
             h, w = rgb.shape[:2]
             try:
-                self.latest.set(self._render(rgb, dets, settings, mock=False, tgt=tgt),
-                                meta=self._frame_meta((rgb_meta or {}).get("t_rx"), bm, "src_rgb_t"))
+                self.latest.set(
+                    self._render(
+                        rgb,
+                        dets,
+                        settings,
+                        mock=False,
+                        tgt=tgt,
+                    ),
+                    meta=self._frame_meta(
+                        (rgb_meta or {}).get("t_rx"),
+                        bm,
+                        "src_rgb_t",
+                    ),
+                )
             except Exception:
-                self._render_stop.wait(0.02); continue
-            # Side panels (thermal + depth) are secondary -> ~10 fps, and reuse
-            # the detector's already-preprocessed thermal (no extra bilateral).
+                self._render_stop.wait(0.02)
+                continue
+            # Thermal side panel: always use the newest FLIR frame directly.
+            # Do not couple thermal display timing to detector/inference timing.
+            try:
+                tb, _, tmeta = self._thermal_sensor.raw.get_meta()
+                tb_t = (tmeta or {}).get("t_rx")
+
+                if tb is not None:
+                    if tb.ndim == 2:
+                        tb = cv2.cvtColor(tb, cv2.COLOR_GRAY2BGR)
+
+                    tb = tb.copy()
+
+                    if tb.shape[:2] != (h, w):
+                        tb = cv2.resize(tb, (w, h))
+
+                    if config.DETECT_SHOW_RES:
+                        tb = self._degrade(
+                            tb,
+                            self._debounced_scale(
+                                "therm",
+                                settings.get("therm_scale", 1.0),
+                                time.time(),
+                            ),
+                        )
+
+                    self.latest_thermal.set(
+                        self._encode_panel(tb, dets, "THERMAL"),
+                        meta=self._frame_meta(
+                            tb_t,
+                            bm,
+                            "src_therm_t",
+                        ),
+                    )
+            except Exception:
+                pass
+            # Depth remains throttled to ~10 fps.
             self._render_i += 1
             if self._render_i % 3 == 0:
                 try:
-                    tb, tb_t = self._therm_disp, self._therm_disp_t
-                    if tb is None:
-                        tv, _, tmeta = self._thermal_sensor.raw.get_meta()
-                        tb_t = (tmeta or {}).get("t_rx")
-                        tb = cv2.cvtColor(tv, cv2.COLOR_GRAY2BGR) if (tv is not None and tv.ndim == 2) else tv
-                    if tb is not None:
-                        tb = tb.copy()
-                        if tb.shape[:2] != (h, w):
-                            tb = cv2.resize(tb, (w, h))
-                        if config.DETECT_SHOW_RES:
-                            tb = self._degrade(tb, self._debounced_scale(
-                                "therm", settings.get("therm_scale", 1.0), time.time()))
-                        self.latest_thermal.set(self._encode_panel(tb, dets, "THERMAL"),
-                                                meta=self._frame_meta(tb_t, bm, "src_therm_t"))
-                except Exception:
-                    pass
-                try:
                     dj, _ = self._rgb_sensor.depth_jpeg.get()
                     if dj is not None:
-                        dimg = cv2.imdecode(np.frombuffer(dj, np.uint8), cv2.IMREAD_COLOR)
+                        dimg = cv2.imdecode(
+                            np.frombuffer(dj, np.uint8),
+                            cv2.IMREAD_COLOR,
+                        )
                         if dimg is not None:
                             if dimg.shape[:2] != (h, w):
                                 dimg = cv2.resize(dimg, (w, h))
-                            self.latest_depth.set(self._encode_panel(dimg, dets, "DEPTH"))
+                            self.latest_depth.set(
+                                self._encode_panel(dimg, dets, "DEPTH")
+                            )
                 except Exception:
                     pass
             now = time.time()
             if last is not None:
                 inst = 1.0 / max(now - last, 1e-6)
-                self._render_fps = inst if self._render_fps == 0 else 0.1 * inst + 0.9 * self._render_fps
+                self._render_fps = (
+                    inst
+                    if self._render_fps == 0
+                    else 0.1 * inst + 0.9 * self._render_fps
+                )
             last = now
             sleep = self._render_interval - (time.time() - t_start)
             if sleep > 0:
