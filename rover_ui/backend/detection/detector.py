@@ -144,8 +144,7 @@ class DetectorThread(SensorThread):
         self._tracker = None
         self._clahe = None            # fallback thermal enhancement (set in open())
         self._thermal_pre = None      # FLIROneProPreprocessor (set in open())
-        self._therm_disp = None       # cached preprocessed thermal for the panel
-        self._therm_disp_t = None     # receive time of the thermal frame behind it
+        self._last_therm_seq = -1     # thermal frame last encoded for the panel
         # Timing of the latest detection pass, for the timing overlay:
         # {t_box: when boxes were ready, src_rgb_t / src_therm_t: receive time
         #  of the frames that pass ran on}. Written with _disp_dets.
@@ -382,8 +381,6 @@ class DetectorThread(SensorThread):
             # Thermal: full-res 640x480 + CLAHE (skip the DQN downscale so the
             # weak FLIR feed gets its best chance); boxes already in RGB coords.
             therm_in = self._preprocess_thermal(therm_bgr) if config.DETECT_THERMAL_ENHANCE else therm_bgr
-            self._therm_disp = therm_in          # cache for the panel (avoid recompute)
-            self._therm_disp_t = therm_t
             td = self._therm_yolo.predict(therm_in, verbose=False, conf=config.DETECT_THERMAL_CONF, iou=0.5, classes=[0])
             therm_boxes = td[0].boxes.xyxy.cpu().numpy() if len(td[0].boxes) > 0 else np.zeros((0, 4))
             therm_scores = td[0].boxes.conf.cpu().numpy() if len(td[0].boxes) > 0 else np.zeros(0)
@@ -608,11 +605,16 @@ class DetectorThread(SensorThread):
                 continue
             # Thermal side panel: always use the newest FLIR frame directly.
             # Do not couple thermal display timing to detector/inference timing.
+            # Encode only when a NEW thermal frame has arrived (~10 fps): this
+            # loop runs at ~30 fps, and re-encoding the same frame just tripled
+            # JPEG work and stream bandwidth. Boxes on the panel therefore
+            # refresh with each new thermal frame (at most ~0.1 s later).
             try:
-                tb, _, tmeta = self._thermal_sensor.raw.get_meta()
+                tb, tseq, tmeta = self._thermal_sensor.raw.get_meta()
                 tb_t = (tmeta or {}).get("t_rx")
 
-                if tb is not None:
+                if tb is not None and tseq != self._last_therm_seq:
+                    self._last_therm_seq = tseq
                     if tb.ndim == 2:
                         tb = cv2.cvtColor(tb, cv2.COLOR_GRAY2BGR)
 
@@ -654,6 +656,7 @@ class DetectorThread(SensorThread):
                         if dimg is not None:
                             if dimg.shape[:2] != (h, w):
                                 dimg = cv2.resize(dimg, (w, h))
+
                             self.latest_depth.set(
                                 self._encode_panel(dimg, dets, "DEPTH")
                             )
