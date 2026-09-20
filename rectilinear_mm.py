@@ -27,11 +27,24 @@ Coordinate convention: the car heading always points "up" (forward) within the
 map. x is positive to the right; z is positive downward (backward), so moving
 "forward (up)" means z decreases = negative. Map and config are entirely in mm.
 
+Footprint rule: every test is on the car's axis-aligned RECTANGLE centred on
+the point, never on the point alone. Obstacles are grown by the car's
+half-width (x) and half-length (z) -- the Minkowski sum -- so testing the
+centre against a grown box is exactly "does the rectangle overlap the box",
+and a straight centre segment hitting a grown box is exactly "does the moving
+rectangle sweep into the box". footprint_gap() gives the matching distance.
+
+After the max-min search, a final pass prefers routes that stay far from
+obstacles EVERYWHERE, not just at the tightest point: each leg costs more the
+closer the car's swept rectangle comes to an obstacle than
+`preferred_clearance` (weight `clearance_weight`). The start/goal pose only
+lowers the inflation of the specific obstacle it is close to
+(`endpoint_clearance` is the floor for how close an endpoint may be).
+
 This file has zero third-party dependencies (stdlib only) and can be copied out
 and used on its own.
 """
 import json
-import math
 import heapq
 
 EPS = 1e-7
@@ -72,12 +85,41 @@ def _seg_hits(ax, az, bx, bz, b):
     return t0 < t1
 
 
+def footprint_gap(ax, az, bx, bz, obstacles, car_w, car_l):
+    """Clearance between the car rectangle swept from centre (ax, az) to
+    (bx, bz) along an AXIS-ALIGNED move (a == b for a single pose) and the
+    nearest obstacle box (x1, z1, x2, z2), in mm.
+
+    Measured the same way the planner inflates boxes (per axis, square
+    corners), so "footprint_gap(p) < c" <=> "p is inside the obstacle grown by
+    the car half-extents + c". Negative = the rectangle overlaps an obstacle.
+    Returns +inf when there are no obstacles."""
+    hw, hl = car_w / 2.0, car_l / 2.0
+    rx1, rx2 = min(ax, bx) - hw, max(ax, bx) + hw
+    rz1, rz2 = min(az, bz) - hl, max(az, bz) + hl
+    best = float("inf")
+    for (x1, z1, x2, z2) in obstacles:
+        g = max(x1 - rx2, rx1 - x2, z1 - rz2, rz1 - z2)
+        if g < best:
+            best = g
+    return best
+
+
 # ----------------- Hanan-grid rectilinear planning -----------------
 def _plan(obstacles, car_w, car_l, start, goal, clearance, turn_penalty,
-          ignore_start_obstacle=False, map_size=None, wall_clearance=0.0):
-    mx = car_w / 2.0 + clearance
-    mz = car_l / 2.0 + clearance
-    boxes = [_inflate(o, mx, mz) for o in obstacles]
+          ignore_start_obstacle=False, map_size=None, wall_clearance=0.0,
+          inflation=None, edge_cost=None, extra_xs=(), extra_zs=(),
+          midlines=False):
+    """Shortest (length + turn_penalty per turn [+ edge_cost]) rectilinear
+    path on the Hanan grid of the grown obstacles.
+
+    inflation : optional per-obstacle clearance (mm), overriding `clearance`.
+    edge_cost : optional f(a, b) -> multiplier (>= 1) applied to a leg's length.
+    extra_xs/zs, midlines : extra candidate grid lines, so a route can run
+                away from obstacle edges (e.g. down the middle of a corridor)."""
+    infl = inflation if inflation is not None else [clearance] * len(obstacles)
+    boxes = [_inflate(o, car_w / 2.0 + e, car_l / 2.0 + e)
+             for o, e in zip(obstacles, infl)]
 
     def free(p):
         return not any(_inside(p[0], p[1], b) for b in boxes)
@@ -111,6 +153,12 @@ def _plan(obstacles, car_w, car_l, start, goal, clearance, turn_penalty,
                    half_l - p[1], (p[1] + half_l) - md)
 
     slack = max(_excess(start), _excess(goal))
+    # The arena itself is never negotiable: an endpoint whose footprint is
+    # (partly) OUTSIDE the map is refused -- the caller must bring the rover
+    # back inside first. Within the wall_clearance band an endpoint may sit
+    # closer to the wall, and the route may then use as much of the band.
+    if map_size is not None and slack > wall_clearance + 1e-6:
+        return None, ("start_blocked" if _excess(start) >= _excess(goal) else "goal_blocked")
 
     def in_map(p):
         if map_size is None:
@@ -131,8 +179,13 @@ def _plan(obstacles, car_w, car_l, start, goal, clearance, turn_penalty,
     if not free(goal):
         return None, "goal_blocked"
 
-    xs = sorted({start[0], goal[0]} | {v for b in boxes for v in (b[0], b[2])})
-    zs = sorted({start[1], goal[1]} | {v for b in boxes for v in (b[1], b[3])})
+    xs = sorted({start[0], goal[0]} | {v for b in boxes for v in (b[0], b[2])}
+                | set(extra_xs))
+    zs = sorted({start[1], goal[1]} | {v for b in boxes for v in (b[1], b[3])}
+                | set(extra_zs))
+    if midlines:
+        xs = sorted(set(xs) | {0.5 * (a + b) for a, b in zip(xs, xs[1:])})
+        zs = sorted(set(zs) | {0.5 * (a + b) for a, b in zip(zs, zs[1:])})
 
     idx, nodes = {}, []
     for x in xs:
@@ -151,6 +204,8 @@ def _plan(obstacles, car_w, car_l, start, goal, clearance, turn_penalty,
             a, b = (xs[i], z), (xs[i + 1], z)
             if a in idx and b in idx and not hits(a[0], a[1], b[0], b[1]):
                 w = xs[i + 1] - xs[i]
+                if edge_cost is not None:
+                    w *= edge_cost(a, b)
                 adj[idx[a]].append((idx[b], w, 1))
                 adj[idx[b]].append((idx[a], w, 1))
     for x in xs:
@@ -158,6 +213,8 @@ def _plan(obstacles, car_w, car_l, start, goal, clearance, turn_penalty,
             a, b = (x, zs[j]), (x, zs[j + 1])
             if a in idx and b in idx and not hits(a[0], a[1], b[0], b[1]):
                 w = zs[j + 1] - zs[j]
+                if edge_cost is not None:
+                    w *= edge_cost(a, b)
                 adj[idx[a]].append((idx[b], w, 2))
                 adj[idx[b]].append((idx[a], w, 2))
 
@@ -291,22 +348,6 @@ def describe_obstacle_schema(map_dict, config_dict=None):
 
 
 # ----------------- clearance maximisation -----------------
-def _body_gap(point, obstacles, car_w, car_l):
-    """Smallest distance from the car body centred at `point` to any RAW
-    obstacle (0 when overlapping). Used to keep the reported clearance honest:
-    a route can be planned wider than the pose the rover starts from, but the
-    figure shown to the operator must not exceed what the rover actually gets."""
-    hw, hl = car_w / 2.0, car_l / 2.0
-    best = None
-    for (x1, z1, x2, z2) in obstacles:
-        dx = max(0.0, x1 - (point[0] + hw), (point[0] - hw) - x2)
-        dz = max(0.0, z1 - (point[1] + hl), (point[1] - hl) - z2)
-        d = math.hypot(dx, dz)
-        if best is None or d < best:
-            best = d
-    return best
-
-
 def _drop_boxes_containing(obstacles, car_w, car_l, point, clearance):
     """Obstacles whose inflated keep-out does NOT contain `point`.
 
@@ -321,96 +362,81 @@ def _drop_boxes_containing(obstacles, car_w, car_l, point, clearance):
             if not _inside(point[0], point[1], _inflate(o, mx, mz))]
 
 
+def _endpoint_caps(obstacles, car_w, car_l, points):
+    """Per obstacle: how much it can be inflated before it swallows one of
+    `points` (the start/goal) -- its footprint_gap to the nearest endpoint,
+    minus 1 mm so the endpoint stays strictly outside."""
+    return [min(footprint_gap(px, pz, px, pz, [o], car_w, car_l) for px, pz in points) - 1.0
+            for o in obstacles]
+
+
+def _route_gap(path, obstacles, car_w, car_l):
+    """Smallest footprint_gap along a planned path (its honest clearance)."""
+    return min(footprint_gap(a[0], a[1], b[0], b[1], obstacles, car_w, car_l)
+               for a, b in zip(path, path[1:])) if len(path) > 1 else \
+        footprint_gap(path[0][0], path[0][1], path[0][0], path[0][1], obstacles, car_w, car_l)
+
+
 def _plan_max_clearance(obstacles, car_w, car_l, start, goal, clearance,
                         turn_penalty, map_size, max_clearance, tol,
-                        wall_clearance=0.0):
-    """Widest-path variant: return the path that maximises the MINIMUM distance
-    between the car body and any obstacle, plus the clearance it achieved.
+                        wall_clearance=0.0, endpoint_clearance=None,
+                        preferred_clearance=0.0, clearance_weight=0.0):
+    """Clearance-first planning. Returns (path | None, achieved_clearance | None, status).
 
-    Feasibility is monotonic in `clearance` -- inflating obstacles only ever
-    shrinks free space -- so if a path exists at some clearance, one exists at
-    every smaller clearance too. The largest feasible clearance is therefore
-    exactly the max-min (bottleneck) clearance, and a binary search finds it.
+    1. Endpoints. An obstacle is never inflated past the start or goal pose
+       (_endpoint_caps): a pose that sits close to ONE panel only lowers that
+       panel's margin, instead of capping the whole route (previously a goal
+       near a panel limited every obstacle, and a start near one kept that
+       panel at the minimum for the entire route). Endpoints closer than
+       `endpoint_clearance` (default: `clearance`) are refused.
+    2. Bottleneck. Feasibility is monotonic in clearance, so a binary search
+       finds the largest clearance c the tightest point of any route admits
+       (floor `clearance`, cap `max_clearance`).
+    3. Everywhere else. One final pass at c prefers routes whose swept car
+       rectangle stays >= `preferred_clearance` from obstacles: each leg costs
+       length x (1 + clearance_weight x shortfall / preferred_clearance), with
+       extra grid lines (corridor midlines, obstacles grown to the preferred
+       clearance) so the route can centre itself and back away from panels.
+    The returned clearance is the smallest footprint_gap along the route."""
+    ep_min = clearance if endpoint_clearance is None else float(endpoint_clearance)
+    for p, status in ((start, "start_blocked"), (goal, "goal_blocked")):
+        if footprint_gap(p[0], p[1], p[0], p[1], obstacles, car_w, car_l) < ep_min:
+            return None, None, status
+    caps = _endpoint_caps(obstacles, car_w, car_l, (start, goal))
 
-    The base clearance is always tried first and kept as the fallback, so this
-    never fails where a plain single-shot plan would have succeeded, and never
-    returns a path with LESS clearance than the configured minimum.
-
-    Returns (path | None, achieved_clearance | None, status).
-    """
-    # Is the rover's body ALREADY overlapping a raw obstacle? If so the start is
-    # a genuine collision, not merely a tight margin, and the relaxation below
-    # must NOT fire: refusing to plan is the correct, visible answer, and the
-    # caller can still pass ignore_start_obstacle=True deliberately to drive out.
-    # Inflating by the half-extents only (no clearance term) is what "body
-    # overlaps the obstacle" means, as distinct from "body is inside the buffer".
-    start_in_raw = any(_inside(start[0], start[1],
-                               _inflate(o, car_w / 2.0, car_l / 2.0))
-                       for o in obstacles)
-    # Obstacles whose BASE keep-out already contains the start. These keep their
-    # base inflation throughout the search (see attempt): they are the ones the
-    # rover is parked too close to, and letting them scale with the trial
-    # clearance is what previously capped the whole plan.
-    _mx0, _mz0 = car_w / 2.0 + clearance, car_l / 2.0 + clearance
-    tight_at_base = {o for o in obstacles
-                     if _inside(start[0], start[1], _inflate(o, _mx0, _mz0))}
-
-    def attempt(c):
-        """Try clearance c, with a PER-OBSTACLE floor so the rover's own pose
-        cannot veto the whole search.
-
-        Without this the search stops the moment a raised clearance swallows the
-        START pose: a rover parked close to a panel could only ever plan at the
-        clearance it happens to be sitting at, so it slid along the obstacle
-        instead of first backing away from it. But simply ignoring that obstacle
-        (the ignore_start_obstacle flag) removes it from the graph entirely, and
-        the route would then drive straight through the panel.
-
-        Instead, obstacles that already contain the start keep their BASE
-        inflation while every other obstacle is inflated to c. The panel is
-        still solid — the route can never cross it — but standing near it no
-        longer caps how wide the rest of the route is planned. The rover's first
-        move is simply to leave, which is the reverse-then-traverse behaviour
-        wanted.
-        """
-        if start_in_raw or not tight_at_base:
-            return _plan(obstacles, car_w, car_l, start, goal, c, turn_penalty,
-                         ignore_start_obstacle=False, map_size=map_size,
-                         wall_clearance=wall_clearance)
-        # Shrink only the obstacles the start is already too close to, by
-        # pre-inflating everything else to c and passing a base clearance of 0.
-        mx_hi, mz_hi = c - clearance, c - clearance
-        mixed = [o if o in tight_at_base
-                 else (o[0] - mx_hi, o[1] - mz_hi, o[2] + mx_hi, o[3] + mz_hi)
-                 for o in obstacles]
-        return _plan(mixed, car_w, car_l, start, goal, clearance, turn_penalty,
-                     ignore_start_obstacle=False, map_size=map_size,
-                     wall_clearance=wall_clearance)
+    def attempt(c, **kw):
+        return _plan(obstacles, car_w, car_l, start, goal, c, turn_penalty,
+                     map_size=map_size, wall_clearance=wall_clearance,
+                     inflation=[max(0.0, min(c, cap)) for cap in caps], **kw)
 
     best, status = attempt(clearance)
     if best is None:
-        return None, None, status              # infeasible at base -> as before
+        return None, None, status
     best_c = float(clearance)
     lo, hi = float(clearance), float(max_clearance)
     tol = max(float(tol), 1.0)
-    # Only search when there is a meaningful band above the base clearance.
     while hi - lo > tol:
         mid = 0.5 * (lo + hi)
         path, _st = attempt(mid)
         if path is None:
-            hi = mid                            # too tight -> shrink the bracket
+            hi = mid
         else:
-            best, best_c, lo = path, mid, mid   # feasible -> keep and push up
-    # The relaxation above lets the search exceed the clearance the rover is
-    # ALREADY sitting at (that is the point: back away, then travel wide). But
-    # the reported figure must describe what the rover really experiences along
-    # the whole route, start pose included, or the UI would claim more margin
-    # than exists and the e-stop comparison would be misleading. Cap the claim
-    # at the start pose's own gap.
-    start_gap = _body_gap(start, obstacles, car_w, car_l)
-    if start_gap is not None and start_gap < best_c:
-        best_c = start_gap
-    return best, best_c, "ok"
+            best, best_c, lo = path, mid, mid
+
+    pref, weight = float(preferred_clearance), float(clearance_weight)
+    if obstacles and pref > 0.0 and weight > 0.0:
+        def cost(a, b):
+            g = footprint_gap(a[0], a[1], b[0], b[1], obstacles, car_w, car_l)
+            return 1.0 + weight * max(0.0, pref - max(g, 0.0)) / pref
+        px, pz = car_w / 2.0 + pref, car_l / 2.0 + pref
+        ex = [v for o in obstacles for v in (o[0] - px, o[2] + px)]
+        ez = [v for o in obstacles for v in (o[1] - pz, o[3] + pz)]
+        wide, _st = attempt(best_c, edge_cost=cost, extra_xs=ex, extra_zs=ez,
+                            midlines=True)
+        if wide is not None:
+            best = wide
+    achieved = _route_gap(best, obstacles, car_w, car_l) if obstacles else best_c
+    return best, achieved, "ok"
 
 
 # ----------------- public API -----------------
@@ -441,10 +467,15 @@ def plan_rectilinear_path_ex(map_file, config_file, start, goal,
                            below `clearance` to disable the search entirely and
                            plan exactly as before.
       clearance_tolerance  search resolution, mm (default 10)
-      wall_clearance       extra gap held between the car body and the ARENA
-                           WALLS, mm (default 0 = body may sit flush with the
-                           edge). The footprint is always kept inside the map
-                           regardless; this only adds margin on top.
+      wall_clearance       gap held between the car body and the ARENA WALLS,
+                           mm (default 0 = flush). The footprint is always
+                           kept inside the map; an endpoint outside it is
+                           refused.
+      endpoint_clearance   how close the start/goal pose may be to an
+                           obstacle, mm (default = clearance)
+      preferred_clearance  distance the whole route tries to keep, mm
+                           (default 0 = off)
+      clearance_weight     how strongly (default 0 = off; ~6 = clearance first)
 
     ignore_start_obstacle: when True, the rover's own current cell is never the
     reason a plan is refused -- any obstacle/clearance zone containing `start`
@@ -462,6 +493,9 @@ def plan_rectilinear_path_ex(map_file, config_file, start, goal,
     max_clearance = c.get("max_clearance", 400)
     tol = c.get("clearance_tolerance", 10)
     wall_clearance = c.get("wall_clearance", 0)
+    endpoint_clearance = c.get("endpoint_clearance", clearance)
+    preferred_clearance = c.get("preferred_clearance", 0)
+    clearance_weight = c.get("clearance_weight", 0)
     size = m.get("size") or {}
     map_size = ((float(size["width"]), float(size["depth"]))
                if "width" in size and "depth" in size else None)
@@ -475,7 +509,10 @@ def plan_rectilinear_path_ex(map_file, config_file, start, goal,
 
     path, achieved, status = _plan_max_clearance(
         obstacles, car_w, car_l, start, goal, clearance, turn_penalty,
-        map_size, max_clearance, tol, wall_clearance=wall_clearance)
+        map_size, max_clearance, tol, wall_clearance=wall_clearance,
+        endpoint_clearance=endpoint_clearance,
+        preferred_clearance=preferred_clearance,
+        clearance_weight=clearance_weight)
     if path is None:
         return None, None
 
