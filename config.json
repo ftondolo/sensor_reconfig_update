@@ -6,9 +6,11 @@
     "width": 550,
     "length": 600
   },
-  "clearance": 75,
+  "clearance": 150,
   "max_clearance": 400,
   "clearance_tolerance": 10,
-  "wall_clearance": 0,
-  "turn_penalty": 1500
+  "wall_clearance": 50,
+  "turn_penalty": 500,
+  "preferred_clearance": 400,
+  "clearance_weight": 6
 }
